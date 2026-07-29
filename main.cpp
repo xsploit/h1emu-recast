@@ -70,18 +70,26 @@ struct TriGrid {
 // Config
 static float CELL_SIZE = 1.2f;
 static float CELL_HEIGHT = 0.1f;
-static const float AGENT_HEIGHT = 2.0f;
-static const float AGENT_RADIUS = 0.5f;
-static const float AGENT_MAX_CLIMB = 1.3f;
-static const float AGENT_MAX_SLOPE = 60.0f;
-static const float REGION_MIN_SIZE = 16.0f;  // voxels 
-static const float REGION_MERGE_SIZE = 3.0f; // voxels
-static const float EDGE_MAX_LEN = 12.0f;     // world units
-static const float EDGE_MAX_ERROR = 1.0f;    // voxels
+static float AGENT_HEIGHT = 2.0f;
+static float AGENT_RADIUS = 0.5f;
+static float AGENT_MAX_CLIMB = 1.3f;
+static float AGENT_MAX_SLOPE = 60.0f;
+static float REGION_MIN_SIZE = 16.0f;  // voxels
+static float REGION_MERGE_SIZE = 3.0f; // voxels
+static float EDGE_MAX_LEN = 12.0f;     // world units
+static float EDGE_MAX_ERROR = 1.0f;    // voxels
 static const int VERTS_PER_POLY = 6;
-static const float DETAIL_SAMPLE_DIST = 6.0f;    // world units
-static const float DETAIL_SAMPLE_MAX_ERR = 2.0f; // voxel heights
-static const int TILE_SIZE = 64;
+static float DETAIL_SAMPLE_DIST = 6.0f;    // world units
+static float DETAIL_SAMPLE_MAX_ERR = 2.0f; // voxel heights
+static int TILE_SIZE = 64;
+
+struct BuildBounds {
+  bool enabled = false;
+  float minX = 0.0f;
+  float minZ = 0.0f;
+  float maxX = 0.0f;
+  float maxZ = 0.0f;
+};
 
 static const int NAVMESHSET_MAGIC = 'M' << 24 | 'S' << 16 | 'E' << 8 | 'T';
 static const int NAVMESHSET_VERSION = 1;
@@ -611,16 +619,164 @@ buildTileCacheLayers(rcContext *ctx, const Mesh &mesh, const TriGrid &grid,
   return result;
 }
 
+static void printUsage(const char *program) {
+  fprintf(stderr,
+          "Usage: %s <input.obj> [output.bin] [options]\n"
+          "\n"
+          "Options:\n"
+          "  --profile legacy|human      Select legacy or fine human defaults\n"
+          "  --cell-size <meters>        Horizontal voxel size\n"
+          "  --cell-height <meters>      Vertical voxel size\n"
+          "  --agent-height <meters>     Required headroom\n"
+          "  --agent-radius <meters>     Clearance from obstacles\n"
+          "  --agent-climb <meters>      Maximum step height\n"
+          "  --agent-slope <degrees>     Maximum walkable slope\n"
+          "  --tile-size <voxels>        Power of two from 16 through 128\n"
+          "  --region-min <voxels>       Minimum region size\n"
+          "  --region-merge <voxels>     Region merge size\n"
+          "  --bounds <minX> <minZ> <maxX> <maxZ>\n"
+          "                              Build only intersecting global tiles\n"
+          "\n"
+          "The human profile uses cs=.2, ch=.1, radius=.2, climb=.5,\n"
+          "slope=45, tile=128, region-min=8, and region-merge=20.\n",
+          program);
+}
+
+static bool parseFloat(const char *text, float &value) {
+  char *end = nullptr;
+  value = strtof(text, &end);
+  return end != text && *end == '\0' && std::isfinite(value);
+}
+
+static bool applyProfile(const char *name) {
+  if (strcmp(name, "legacy") == 0) {
+    CELL_SIZE = 1.2f;
+    CELL_HEIGHT = 0.1f;
+    AGENT_HEIGHT = 2.0f;
+    AGENT_RADIUS = 0.5f;
+    AGENT_MAX_CLIMB = 1.3f;
+    AGENT_MAX_SLOPE = 60.0f;
+    REGION_MIN_SIZE = 16.0f;
+    REGION_MERGE_SIZE = 3.0f;
+    TILE_SIZE = 64;
+    return true;
+  }
+  if (strcmp(name, "human") == 0) {
+    CELL_SIZE = 0.2f;
+    CELL_HEIGHT = 0.1f;
+    AGENT_HEIGHT = 2.0f;
+    AGENT_RADIUS = 0.2f;
+    AGENT_MAX_CLIMB = 0.5f;
+    AGENT_MAX_SLOPE = 45.0f;
+    REGION_MIN_SIZE = 8.0f;
+    REGION_MERGE_SIZE = 20.0f;
+    TILE_SIZE = 128;
+    return true;
+  }
+  fprintf(stderr, "Unknown profile: %s\n", name);
+  return false;
+}
+
+static bool parseOptions(int argc, char *argv[], int start,
+                         BuildBounds &bounds) {
+  for (int i = start; i < argc; ++i) {
+    if (strcmp(argv[i], "--profile") == 0) {
+      if (++i >= argc || !applyProfile(argv[i]))
+        return false;
+    }
+  }
+
+  for (int i = start; i < argc; ++i) {
+    const char *arg = argv[i];
+    if (strcmp(arg, "--profile") == 0) {
+      ++i;
+      continue;
+    }
+    if (strcmp(arg, "--help") == 0) {
+      printUsage(argv[0]);
+      return false;
+    }
+    if (strcmp(arg, "--bounds") == 0) {
+      if (i + 4 >= argc || !parseFloat(argv[i + 1], bounds.minX) ||
+          !parseFloat(argv[i + 2], bounds.minZ) ||
+          !parseFloat(argv[i + 3], bounds.maxX) ||
+          !parseFloat(argv[i + 4], bounds.maxZ)) {
+        fprintf(stderr, "Invalid --bounds values\n");
+        return false;
+      }
+      bounds.enabled = true;
+      i += 4;
+      continue;
+    }
+
+    float *target = nullptr;
+    if (strcmp(arg, "--cell-size") == 0)
+      target = &CELL_SIZE;
+    else if (strcmp(arg, "--cell-height") == 0)
+      target = &CELL_HEIGHT;
+    else if (strcmp(arg, "--agent-height") == 0)
+      target = &AGENT_HEIGHT;
+    else if (strcmp(arg, "--agent-radius") == 0)
+      target = &AGENT_RADIUS;
+    else if (strcmp(arg, "--agent-climb") == 0)
+      target = &AGENT_MAX_CLIMB;
+    else if (strcmp(arg, "--agent-slope") == 0)
+      target = &AGENT_MAX_SLOPE;
+    else if (strcmp(arg, "--region-min") == 0)
+      target = &REGION_MIN_SIZE;
+    else if (strcmp(arg, "--region-merge") == 0)
+      target = &REGION_MERGE_SIZE;
+
+    if (target) {
+      if (++i >= argc || !parseFloat(argv[i], *target)) {
+        fprintf(stderr, "Invalid value for %s\n", arg);
+        return false;
+      }
+      continue;
+    }
+    if (strcmp(arg, "--tile-size") == 0) {
+      float value = 0.0f;
+      if (++i >= argc || !parseFloat(argv[i], value) ||
+          value != floorf(value)) {
+        fprintf(stderr, "Invalid value for --tile-size\n");
+        return false;
+      }
+      TILE_SIZE = (int)value;
+      continue;
+    }
+
+    fprintf(stderr, "Unknown option: %s\n", arg);
+    return false;
+  }
+
+  if (CELL_SIZE <= 0.0f || CELL_HEIGHT <= 0.0f ||
+      AGENT_HEIGHT <= 0.0f || AGENT_RADIUS < 0.0f ||
+      AGENT_MAX_CLIMB < 0.0f || AGENT_MAX_SLOPE <= 0.0f ||
+      AGENT_MAX_SLOPE >= 90.0f || REGION_MIN_SIZE <= 0.0f ||
+      REGION_MERGE_SIZE <= 0.0f || TILE_SIZE < 16 || TILE_SIZE > 128 ||
+      (TILE_SIZE & (TILE_SIZE - 1)) != 0) {
+    fprintf(stderr, "Invalid build configuration\n");
+    return false;
+  }
+  if (bounds.enabled &&
+      (bounds.minX >= bounds.maxX || bounds.minZ >= bounds.maxZ)) {
+    fprintf(stderr, "Invalid build bounds\n");
+    return false;
+  }
+  return true;
+}
+
 int main(int argc, char *argv[]) {
   if (argc < 2) {
-    fprintf(stderr, "Usage: %s <input.obj> [output.bin]\n", argv[0]);
+    printUsage(argv[0]);
     return 1;
   }
 
   const char *inputPath = argv[1];
   std::string outputPath;
-  if (argc >= 3) {
-    outputPath = argv[2];
+  int optionStart = 2;
+  if (argc >= 3 && strncmp(argv[2], "--", 2) != 0) {
+    outputPath = argv[optionStart++];
   } else {
     outputPath = inputPath;
     auto dot = outputPath.rfind('.');
@@ -628,6 +784,9 @@ int main(int argc, char *argv[]) {
       outputPath = outputPath.substr(0, dot);
     outputPath += ".bin";
   }
+  BuildBounds bounds;
+  if (!parseOptions(argc, argv, optionStart, bounds))
+    return 1;
 
   TimePoint tTotal = Clock::now();
 
@@ -648,15 +807,36 @@ int main(int argc, char *argv[]) {
   rcCalcGridSize(mesh.bmin, mesh.bmax, CELL_SIZE, &gw, &gh);
   const int tw = (gw + TILE_SIZE - 1) / TILE_SIZE;
   const int th = (gh + TILE_SIZE - 1) / TILE_SIZE;
-  const int totalTiles = tw * th;
+  const float tileWorldSize = (float)TILE_SIZE * CELL_SIZE;
+  int firstTx = 0;
+  int firstTy = 0;
+  int lastTx = tw;
+  int lastTy = th;
+  if (bounds.enabled) {
+    firstTx = std::clamp(
+        (int)floorf((bounds.minX - mesh.bmin[0]) / tileWorldSize), 0, tw);
+    firstTy = std::clamp(
+        (int)floorf((bounds.minZ - mesh.bmin[2]) / tileWorldSize), 0, th);
+    lastTx = std::clamp(
+        (int)ceilf((bounds.maxX - mesh.bmin[0]) / tileWorldSize), 0, tw);
+    lastTy = std::clamp(
+        (int)ceilf((bounds.maxZ - mesh.bmin[2]) / tileWorldSize), 0, th);
+  }
+  const int totalTiles = (lastTx - firstTx) * (lastTy - firstTy);
+  if (totalTiles <= 0) {
+    fprintf(stderr, "Build bounds do not intersect the mesh\n");
+    return 1;
+  }
 
   const int tileBits =
       rcMin((int)ilog2(nextPow2((unsigned int)totalTiles)), 14);
   const int maxTiles = 1 << tileBits;
   const int maxPolysPerTile = 1 << (22 - tileBits);
 
-  printf("Tile grid : %d x %d = %d tiles  (%.2f wu/tile)\n", tw, th, totalTiles,
-         (float)TILE_SIZE * CELL_SIZE);
+  printf("Tile grid : %d x %d full; building [%d..%d) x [%d..%d) = %d tiles"
+         "  (%.2f wu/tile)\n",
+         tw, th, firstTx, lastTx, firstTy, lastTy, totalTiles,
+         tileWorldSize);
   printf("Tile bits : %d  →  maxTiles=%d  maxPolys/tile=%d\n", tileBits,
          maxTiles, maxPolysPerTile);
   printf("Voxel     : cs=%.3f  ch=%.3f\n", CELL_SIZE, CELL_HEIGHT);
@@ -687,7 +867,7 @@ int main(int argc, char *argv[]) {
   tcParams.walkableRadius = AGENT_RADIUS;
   tcParams.walkableClimb = AGENT_MAX_CLIMB;
   tcParams.maxSimplificationError = EDGE_MAX_ERROR;
-  const int rawMaxTiles = tw * th * EXPECTED_LAYERS_PER_TILE;
+  const int rawMaxTiles = totalTiles * EXPECTED_LAYERS_PER_TILE;
   const int tcTileBits = (int)ilog2(nextPow2((unsigned int)rawMaxTiles));
   const int cappedMaxTiles = 1 << tcTileBits;
   tcParams.maxTiles = cappedMaxTiles;
@@ -724,7 +904,6 @@ int main(int argc, char *argv[]) {
 #else
   printf("Building navmesh (single-threaded)...\n");
 #endif
-  const float tileWorldSize = (float)TILE_SIZE * CELL_SIZE;
   int builtTiles = 0;
   int emptyTiles = 0;
   long long totalNavBytes = 0;
@@ -735,8 +914,8 @@ int main(int argc, char *argv[]) {
 
   std::vector<std::pair<int, int>> tileList;
   tileList.reserve(totalTiles);
-  for (int ty = 0; ty < th; ++ty)
-    for (int tx = 0; tx < tw; ++tx)
+  for (int ty = firstTy; ty < lastTy; ++ty)
+    for (int tx = firstTx; tx < lastTx; ++tx)
       tileList.push_back({tx, ty});
 
   std::mutex navMeshMutex; // guards writes and progress counters

@@ -28,11 +28,16 @@ target_include_directories(navmesh-builder PRIVATE
     ${RECAST_DIR}/RecastDemo/Contrib/fastlz
 )
 
-target_compile_options(navmesh-builder PRIVATE
-    -Wall -Wextra
-    -march=native
-    -ffast-math
-)
+if(MSVC)
+    target_compile_options(navmesh-builder PRIVATE /W4 /O2 /fp:fast)
+    target_compile_definitions(navmesh-builder PRIVATE _CRT_SECURE_NO_WARNINGS)
+else()
+    target_compile_options(navmesh-builder PRIVATE
+        -Wall -Wextra
+        -march=native
+        -ffast-math
+    )
+endif()
 
 find_package(OpenMP)
 if(OpenMP_CXX_FOUND)
