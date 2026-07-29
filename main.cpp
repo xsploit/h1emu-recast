@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -1016,10 +1017,8 @@ int main(int argc, char *argv[]) {
     tiles.push_back(tile);
   }
 
-  std::string outDir;
-  auto lastSlash = outputPath.rfind('/');
-  if (lastSlash != std::string::npos)
-    outDir = outputPath.substr(0, lastSlash + 1);
+  const std::filesystem::path outDir =
+      std::filesystem::path(outputPath).parent_path();
 
   struct PartRange {
     size_t start, count;
@@ -1050,7 +1049,8 @@ int main(int argc, char *argv[]) {
   TimePoint tSave = Clock::now();
 
   for (size_t p = 0; p < parts.size(); p++) {
-    std::string partPath = outDir + "z1_" + std::to_string(p) + ".bin";
+    const std::string partPath =
+        (outDir / ("z1_" + std::to_string(p) + ".bin")).string();
     printf("Writing %s ...", partPath.c_str());
     fflush(stdout);
 
@@ -1118,7 +1118,8 @@ int main(int argc, char *argv[]) {
 
   TimePoint tCacheSave = Clock::now();
   for (size_t p = 0; p < cacheParts.size(); p++) {
-    std::string partPath = outDir + "z1_cache_" + std::to_string(p) + ".bin";
+    const std::string partPath =
+        (outDir / ("z1_cache_" + std::to_string(p) + ".bin")).string();
     printf("Writing %s ...", partPath.c_str());
     fflush(stdout);
 
