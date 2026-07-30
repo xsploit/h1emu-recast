@@ -1,6 +1,7 @@
 /build/
 /build-*/
 /full-human/
+/full-human-*/
 /validation-*/
 /run-*-validation.cmd
 /run-full-human.cmd
