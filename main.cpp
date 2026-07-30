@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -209,14 +210,30 @@ static void printProgress(int done, int total, int built, long long totalBytes,
 }
 
 class PrintContext : public rcContext {
+  int tileX;
+  int tileY;
+
 protected:
   void doLog(const rcLogCategory category, const char *msg,
              const int /*len*/) override {
-    if (category == RC_LOG_ERROR)
-      fprintf(stderr, "\n[ERROR] %s\n", msg);
-    else if (category == RC_LOG_WARNING)
-      fprintf(stderr, "\n[WARN]  %s\n", msg);
+    if (category == RC_LOG_ERROR) {
+      hadError = true;
+      if (tileX >= 0)
+        fprintf(stderr, "\n[ERROR] tile=(%d,%d) %s\n", tileX, tileY, msg);
+      else
+        fprintf(stderr, "\n[ERROR] %s\n", msg);
+    } else if (category == RC_LOG_WARNING) {
+      if (tileX >= 0)
+        fprintf(stderr, "\n[WARN]  tile=(%d,%d) %s\n", tileX, tileY, msg);
+      else
+        fprintf(stderr, "\n[WARN]  %s\n", msg);
+    }
   }
+
+public:
+  bool hadError = false;
+
+  PrintContext(int x = -1, int y = -1) : tileX(x), tileY(y) {}
 };
 
 static unsigned int nextPow2(unsigned int v) {
@@ -250,6 +267,13 @@ struct Mesh {
   float bmax[3];
 };
 
+static std::string lowerObjectName(const std::string &name) {
+  std::string lower = name;
+  std::transform(lower.begin(), lower.end(), lower.begin(),
+                 [](unsigned char c) { return (char)std::tolower(c); });
+  return lower;
+}
+
 static bool loadObj(const char *path, Mesh &out) {
   printf("Loading %s ...\n", path);
   TimePoint t0 = Clock::now();
@@ -264,8 +288,59 @@ static bool loadObj(const char *path, Mesh &out) {
   out.bmax[0] = out.bmax[1] = out.bmax[2] = -1e30f;
 
   char line[4096];
+  std::string objectName;
+  float objectMin[3] = {1e30f, 1e30f, 1e30f};
+  float objectMax[3] = {-1e30f, -1e30f, -1e30f};
+  size_t objectTriStart = 0;
+  int excludedHospitalDecorationObjects = 0;
+  long long excludedHospitalDecorationTriangles = 0;
+  float debugMinX = 0.0f, debugMinZ = 0.0f, debugMaxX = 0.0f,
+        debugMaxZ = 0.0f;
+  const char *debugBounds = getenv("H1EMU_NAV_DEBUG_OBJECT_BOUNDS");
+  const bool debugObjects =
+      debugBounds &&
+      sscanf(debugBounds, "%f,%f,%f,%f", &debugMinX, &debugMinZ, &debugMaxX,
+             &debugMaxZ) == 4;
+  const auto finishObject = [&]() {
+    if (objectName.empty() || objectMin[0] > objectMax[0])
+      return;
+    const std::string lower = lowerObjectName(objectName);
+    const float spanX = objectMax[0] - objectMin[0];
+    const float spanY = objectMax[1] - objectMin[1];
+    const float spanZ = objectMax[2] - objectMin[2];
+    // These thin meshes repeat across every hospital floor and are not
+    // traversal surfaces. Rasterizing them as walkable creates hundreds of
+    // artificial overlapping regions in a single tile column.
+    const bool thinHospitalDecoration =
+        lower.rfind("hospital_props_ceilinglight", 0) == 0 ||
+        lower.rfind("hospital_props_paperdebris", 0) == 0;
+    const bool excluded = thinHospitalDecoration;
+    if (excluded) {
+      const size_t removed = (out.tris.size() - objectTriStart) / 3;
+      out.tris.resize(objectTriStart);
+      excludedHospitalDecorationObjects++;
+      excludedHospitalDecorationTriangles += (long long)removed;
+    }
+    if (debugObjects && !excluded && objectMax[0] >= debugMinX &&
+        objectMin[0] <= debugMaxX && objectMax[2] >= debugMinZ &&
+        objectMin[2] <= debugMaxZ) {
+      printf("[NAV-OBJECT] %s tris=%zu span=(%.2f,%.2f,%.2f) "
+             "bounds=(%.2f,%.2f)-(%.2f,%.2f)\n",
+             objectName.c_str(), (out.tris.size() - objectTriStart) / 3,
+             spanX, spanY, spanZ, objectMin[0], objectMin[2], objectMax[0],
+             objectMax[2]);
+    }
+  };
   while (fgets(line, sizeof(line), f)) {
-    if (line[0] == 'v' && line[1] == ' ') {
+    if (line[0] == 'o' && line[1] == ' ') {
+      finishObject();
+      char *name = line + 2;
+      name[strcspn(name, "\r\n")] = '\0';
+      objectName = name;
+      objectMin[0] = objectMin[1] = objectMin[2] = 1e30f;
+      objectMax[0] = objectMax[1] = objectMax[2] = -1e30f;
+      objectTriStart = out.tris.size();
+    } else if (line[0] == 'v' && line[1] == ' ') {
       float x, y, z;
       if (sscanf(line + 2, "%f %f %f", &x, &y, &z) == 3) {
         out.verts.push_back(x);
@@ -277,6 +352,12 @@ static bool loadObj(const char *path, Mesh &out) {
         out.bmax[1] = std::max(out.bmax[1], y);
         out.bmin[2] = std::min(out.bmin[2], z);
         out.bmax[2] = std::max(out.bmax[2], z);
+        objectMin[0] = std::min(objectMin[0], x);
+        objectMax[0] = std::max(objectMax[0], x);
+        objectMin[1] = std::min(objectMin[1], y);
+        objectMax[1] = std::max(objectMax[1], y);
+        objectMin[2] = std::min(objectMin[2], z);
+        objectMax[2] = std::max(objectMax[2], z);
       }
     } else if (line[0] == 'f' && line[1] == ' ') {
       int idx[8];
@@ -304,6 +385,7 @@ static bool loadObj(const char *path, Mesh &out) {
       }
     }
   }
+  finishObject();
   fclose(f);
 
   if (out.verts.empty() || out.tris.empty()) {
@@ -313,6 +395,9 @@ static bool loadObj(const char *path, Mesh &out) {
 
   printf("  %d verts, %d tris  (%.2fs)\n", (int)(out.verts.size() / 3),
          (int)(out.tris.size() / 3), elapsed(t0));
+  printf("  Excluded %d thin hospital decorations (%lld triangles)\n",
+         excludedHospitalDecorationObjects,
+         excludedHospitalDecorationTriangles);
   printf("  Bounds X [%.2f .. %.2f]  Y [%.2f .. %.2f]  Z [%.2f .. %.2f]\n",
          out.bmin[0], out.bmax[0], out.bmin[1], out.bmax[1], out.bmin[2],
          out.bmax[2]);
@@ -401,10 +486,9 @@ static unsigned char *buildTile(rcContext *ctx, const Mesh &mesh,
     return nullptr;
   }
 
-  // Watershed -> best quality
-  if (!rcBuildDistanceField(ctx, *chf) ||
-      !rcBuildRegions(ctx, *chf, cfg.borderSize, cfg.minRegionArea,
-                      cfg.mergeRegionArea)) {
+  // Layer partitioning is designed for tiled, multi-storey worlds and cannot
+  // produce the overlapping regions that make watershed fail in dense POIs.
+  if (!rcBuildLayerRegions(ctx, *chf, cfg.borderSize, cfg.minRegionArea)) {
     rcFreeCompactHeightfield(chf);
     return nullptr;
   }
@@ -911,6 +995,7 @@ int main(int argc, char *argv[]) {
   int totalPolys = 0;
   int totalCacheLayers = 0;
   int maxLayersPerTile = 0;
+  int failedRecastTiles = 0;
   TimePoint tBuild = Clock::now();
 
   std::vector<std::pair<int, int>> tileList;
@@ -938,12 +1023,12 @@ int main(int argc, char *argv[]) {
     tmax[1] = mesh.bmax[1];
     tmax[2] = mesh.bmin[2] + (float)(ty + 1) * tileWorldSize;
 
-    PrintContext tileCtx;
+    PrintContext tileCtx(tx, ty);
     int dataSize = 0;
     unsigned char *data =
         buildTile(&tileCtx, mesh, grid, tmin, tmax, tx, ty, dataSize);
 
-    PrintContext cacheCtx;
+    PrintContext cacheCtx(tx, ty);
     auto cacheLayers =
         buildTileCacheLayers(&cacheCtx, mesh, grid, tmin, tmax, tx, ty);
 
@@ -967,6 +1052,8 @@ int main(int argc, char *argv[]) {
         }
       }
       int layersThisTile = (int)cacheLayers.size();
+      if (tileCtx.hadError || cacheCtx.hadError)
+        failedRecastTiles++;
       totalCacheLayers += layersThisTile;
       if (layersThisTile > maxLayersPerTile)
         maxLayersPerTile = layersThisTile;
@@ -1003,6 +1090,15 @@ int main(int argc, char *argv[]) {
          maxLayersPerTile > EXPECTED_LAYERS_PER_TILE
              ? "  *** LAYERS DROPPED ***"
              : "");
+  if (failedRecastTiles > 0) {
+    fprintf(stderr,
+            "\n[ERROR] Navmesh build failed in %d tile(s); refusing to write "
+            "a partial cache.\n",
+            failedRecastTiles);
+    dtFreeNavMesh(navMesh);
+    dtFreeTileCache(tileCache);
+    return 1;
+  }
 
   // split into 25 MB parts
   static const size_t MAX_PART_BYTES = 25ULL * 1024 * 1024;
@@ -1019,6 +1115,17 @@ int main(int argc, char *argv[]) {
 
   const std::filesystem::path outDir =
       std::filesystem::path(outputPath).parent_path();
+  if (!outDir.empty()) {
+    std::error_code createError;
+    std::filesystem::create_directories(outDir, createError);
+    if (createError) {
+      fprintf(stderr, "\nCannot create output directory %s: %s\n",
+              outDir.string().c_str(), createError.message().c_str());
+      dtFreeNavMesh(navMesh);
+      dtFreeTileCache(tileCache);
+      return 1;
+    }
+  }
 
   struct PartRange {
     size_t start, count;
