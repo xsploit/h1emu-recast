@@ -28,6 +28,13 @@ target_include_directories(navmesh-builder PRIVATE
     ${RECAST_DIR}/RecastDemo/Contrib/fastlz
 )
 
+target_compile_definitions(navmesh-builder PRIVATE
+    # Dense multi-storey interiors can exceed Recast's conservative default
+    # of 63 overlapping heightfield layers. Layer ids are stored as bytes, so
+    # 255 is the maximum supported value.
+    RC_MAX_LAYERS_DEF=255
+)
+
 if(MSVC)
     target_compile_options(navmesh-builder PRIVATE /W4 /O2 /fp:fast)
     target_compile_definitions(navmesh-builder PRIVATE _CRT_SECURE_NO_WARNINGS)

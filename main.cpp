@@ -638,7 +638,7 @@ static void printUsage(const char *program) {
           "  --bounds <minX> <minZ> <maxX> <maxZ>\n"
           "                              Build only intersecting global tiles\n"
           "\n"
-          "The human profile uses cs=.2, ch=.1, radius=.2, climb=.5,\n"
+          "The human profile uses cs=.2, ch=.1, radius=.2, climb=1.3,\n"
           "slope=45, tile=128, region-min=8, and region-merge=20.\n",
           program);
 }
@@ -667,7 +667,7 @@ static bool applyProfile(const char *name) {
     CELL_HEIGHT = 0.1f;
     AGENT_HEIGHT = 2.0f;
     AGENT_RADIUS = 0.2f;
-    AGENT_MAX_CLIMB = 0.5f;
+    AGENT_MAX_CLIMB = 1.3f;
     AGENT_MAX_SLOPE = 45.0f;
     REGION_MIN_SIZE = 8.0f;
     REGION_MERGE_SIZE = 20.0f;
