@@ -325,10 +325,10 @@ static bool loadObj(const char *path, Mesh &out) {
         objectMin[0] <= debugMaxX && objectMax[2] >= debugMinZ &&
         objectMin[2] <= debugMaxZ) {
       printf("[NAV-OBJECT] %s tris=%zu span=(%.2f,%.2f,%.2f) "
-             "bounds=(%.2f,%.2f)-(%.2f,%.2f)\n",
+             "bounds=(%.2f,%.2f,%.2f)-(%.2f,%.2f,%.2f)\n",
              objectName.c_str(), (out.tris.size() - objectTriStart) / 3,
-             spanX, spanY, spanZ, objectMin[0], objectMin[2], objectMax[0],
-             objectMax[2]);
+             spanX, spanY, spanZ, objectMin[0], objectMin[1], objectMin[2],
+             objectMax[0], objectMax[1], objectMax[2]);
     }
   };
   while (fgets(line, sizeof(line), f)) {

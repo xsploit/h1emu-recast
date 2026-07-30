@@ -2,6 +2,8 @@
 /build-*/
 /full-human/
 /full-human-*/
+/diagnostic-*/
+/verify-*/
 /validation-*/
 /run-*-validation.cmd
 /run-full-human.cmd
