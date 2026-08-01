@@ -21,7 +21,7 @@ cmake --build build-msvc --parallel
 ## Run
 
 ```sh
-./build/navmesh-builder ./world.obj ./out/navmesh.bin --profile human
+./build/navmesh-builder ./world-semantic.obj ./out/navmesh.bin --profile human
 ```
 
 The builder takes the path to a world `.obj` file and outputs the generated
@@ -36,3 +36,35 @@ Use `--bounds minX minZ maxX maxZ` for repeatable regional validation before a
 full-map bake. Individual settings can be overridden with `--cell-size`,
 `--cell-height`, `--agent-height`, `--agent-radius`, `--agent-climb`,
 `--agent-slope`, `--tile-size`, `--region-min`, and `--region-merge`.
+
+## Semantic geometry contract
+
+Semantic OBJ input assigns every face exactly one canonical `usemtl` value:
+
+| Material | Area | Polygon flags | Bake action |
+| --- | ---: | --- | --- |
+| `nav_terrain` | 1 | `WALK` | rasterize |
+| `nav_road` | 2 | `WALK` | rasterize |
+| `nav_floor_exterior` | 3 | `WALK` | rasterize |
+| `nav_floor_interior` | 4 | `WALK \| INDOOR` | rasterize |
+| `nav_stair` | 5 | `WALK \| TRANSITION` | rasterize |
+| `nav_ramp` | 6 | `WALK \| TRANSITION` | rasterize |
+| `nav_threshold` | 7 | `WALK \| TRANSITION \| DOOR` | rasterize |
+| `nav_obstacle_static` | 0 | none | rasterize non-walkable |
+| `nav_door_panel_dynamic` | 0 | none | exclude for runtime door obstacle |
+| `nav_exclude` | 0 | none | exclude |
+| `nav_unknown` | 0 | none | rasterize non-walkable and warn |
+
+Flag values are `WALK=0x01`, `INDOOR=0x02`, `TRANSITION=0x04`, and
+`DOOR=0x08`. Unknown `nav_*` materials are fatal. Untagged faces and ordinary
+materials are fatal in semantic input, preventing silent taxonomy drift.
+
+Pre-semantic OBJ files are supported only with the explicit
+`--legacy-object-fallback` option. This enables the historical object-name
+rules without allowing them to override canonical semantic faces.
+
+Every run writes `<output>.semantics.json` with the semantic contract,
+deterministic material histogram, taxonomy, warnings, input size/hash, and
+legacy-mode state. Use `--semantic-report <path>` to choose another path.
+`--validate-semantics-only --require-all-semantics` validates a fixture without
+building any tiles.

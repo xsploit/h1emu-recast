@@ -6,7 +6,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <map>
 #include <mutex>
+#include <set>
+#include <sstream>
 #include <string>
 #include <vector>
 #ifdef USE_OPENMP
@@ -85,12 +90,122 @@ static float DETAIL_SAMPLE_DIST = 6.0f;    // world units
 static float DETAIL_SAMPLE_MAX_ERR = 2.0f; // voxel heights
 static int TILE_SIZE = 64;
 
+static const char *SEMANTIC_CONTRACT = "h1emu-nav-semantics-v1";
+
+enum class NavSemantic : unsigned char {
+  Untagged,
+  OrdinaryMaterial,
+  Terrain,
+  Road,
+  FloorExterior,
+  FloorInterior,
+  Stair,
+  Ramp,
+  Threshold,
+  ObstacleStatic,
+  DoorPanelDynamic,
+  Exclude,
+  Unknown,
+  Invalid
+};
+
+enum NavArea : unsigned char {
+  NAV_AREA_TERRAIN = 1,
+  NAV_AREA_ROAD = 2,
+  NAV_AREA_FLOOR_EXTERIOR = 3,
+  NAV_AREA_FLOOR_INTERIOR = 4,
+  NAV_AREA_STAIR = 5,
+  NAV_AREA_RAMP = 6,
+  NAV_AREA_THRESHOLD = 7
+};
+
+enum NavFlag : unsigned short {
+  NAV_FLAG_WALK = 0x01,
+  NAV_FLAG_INDOOR = 0x02,
+  NAV_FLAG_TRANSITION = 0x04,
+  NAV_FLAG_DOOR = 0x08
+};
+
+struct SemanticSpec {
+  NavSemantic semantic;
+  const char *material;
+  unsigned char area;
+  unsigned short flags;
+  bool rasterizeNull;
+  bool exclude;
+};
+
+static const SemanticSpec SEMANTIC_SPECS[] = {
+    {NavSemantic::Terrain, "nav_terrain", NAV_AREA_TERRAIN, NAV_FLAG_WALK,
+     false, false},
+    {NavSemantic::Road, "nav_road", NAV_AREA_ROAD, NAV_FLAG_WALK, false,
+     false},
+    {NavSemantic::FloorExterior, "nav_floor_exterior",
+     NAV_AREA_FLOOR_EXTERIOR, NAV_FLAG_WALK, false, false},
+    {NavSemantic::FloorInterior, "nav_floor_interior",
+     NAV_AREA_FLOOR_INTERIOR, NAV_FLAG_WALK | NAV_FLAG_INDOOR, false, false},
+    {NavSemantic::Stair, "nav_stair", NAV_AREA_STAIR,
+     NAV_FLAG_WALK | NAV_FLAG_TRANSITION, false, false},
+    {NavSemantic::Ramp, "nav_ramp", NAV_AREA_RAMP,
+     NAV_FLAG_WALK | NAV_FLAG_TRANSITION, false, false},
+    {NavSemantic::Threshold, "nav_threshold", NAV_AREA_THRESHOLD,
+     NAV_FLAG_WALK | NAV_FLAG_TRANSITION | NAV_FLAG_DOOR, false, false},
+    {NavSemantic::ObstacleStatic, "nav_obstacle_static", RC_NULL_AREA, 0,
+     true, false},
+    {NavSemantic::DoorPanelDynamic, "nav_door_panel_dynamic", RC_NULL_AREA, 0,
+     false, true},
+    {NavSemantic::Exclude, "nav_exclude", RC_NULL_AREA, 0, false, true},
+    {NavSemantic::Unknown, "nav_unknown", RC_NULL_AREA, 0, true, false},
+};
+
+static const SemanticSpec *semanticSpec(NavSemantic semantic) {
+  for (const SemanticSpec &spec : SEMANTIC_SPECS)
+    if (spec.semantic == semantic)
+      return &spec;
+  return nullptr;
+}
+
+static NavSemantic parseSemanticMaterial(const std::string &material) {
+  for (const SemanticSpec &spec : SEMANTIC_SPECS)
+    if (material == spec.material)
+      return spec.semantic;
+  if (material.rfind("nav_", 0) == 0)
+    return NavSemantic::Invalid;
+  return NavSemantic::OrdinaryMaterial;
+}
+
+static unsigned short flagsForArea(unsigned char area) {
+  switch (area) {
+  case NAV_AREA_TERRAIN:
+  case NAV_AREA_ROAD:
+  case NAV_AREA_FLOOR_EXTERIOR:
+    return NAV_FLAG_WALK;
+  case NAV_AREA_FLOOR_INTERIOR:
+    return NAV_FLAG_WALK | NAV_FLAG_INDOOR;
+  case NAV_AREA_STAIR:
+  case NAV_AREA_RAMP:
+    return NAV_FLAG_WALK | NAV_FLAG_TRANSITION;
+  case NAV_AREA_THRESHOLD:
+    return NAV_FLAG_WALK | NAV_FLAG_TRANSITION | NAV_FLAG_DOOR;
+  default:
+    return 0;
+  }
+}
+
 struct BuildBounds {
   bool enabled = false;
   float minX = 0.0f;
   float minZ = 0.0f;
   float maxX = 0.0f;
   float maxZ = 0.0f;
+};
+
+struct BuildOptions {
+  BuildBounds bounds;
+  bool legacyObjectFallback = false;
+  bool validateSemanticsOnly = false;
+  bool requireAllSemantics = false;
+  std::string semanticReportPath;
 };
 
 static const int NAVMESHSET_MAGIC = 'M' << 24 | 'S' << 16 | 'E' << 8 | 'T';
@@ -145,10 +260,10 @@ struct FastLZCompressor : dtTileCacheCompressor {
 };
 
 struct NullMeshProcess : dtTileCacheMeshProcess {
-  void process(dtNavMeshCreateParams *params, unsigned char * /*polyAreas*/,
+  void process(dtNavMeshCreateParams *params, unsigned char *polyAreas,
                unsigned short *polyFlags) override {
     for (int i = 0; i < params->polyCount; ++i)
-      polyFlags[i] = 1;
+      polyFlags[i] = flagsForArea(polyAreas[i]);
   }
 };
 
@@ -272,7 +387,18 @@ struct Mesh {
   // rasterize into the heightfield as solid geometry, but their upward faces
   // must never become walkable navmesh.
   std::vector<unsigned char> nonWalkableTris;
+  // Parallel to tris (one entry per triangle). Semantic OBJ input assigns one
+  // canonical nav_* material to every source face before triangulation.
+  std::vector<NavSemantic> triangleSemantics;
   std::vector<NonWalkableVolume> nonWalkableVolumes;
+  std::map<std::string, long long> semanticHistogram;
+  std::set<std::string> invalidSemanticMaterials;
+  long long sourceTriangles = 0;
+  long long excludedSemanticTriangles = 0;
+  long long fallbackTriangles = 0;
+  long long ordinaryMaterialTriangles = 0;
+  bool semanticInput = false;
+  bool legacyObjectFallback = false;
   float bmin[3];
   float bmax[3];
 };
@@ -284,7 +410,7 @@ static std::string lowerObjectName(const std::string &name) {
   return lower;
 }
 
-static bool loadObj(const char *path, Mesh &out) {
+static bool loadObj(const char *path, Mesh &out, bool legacyObjectFallback) {
   printf("Loading %s ...\n", path);
   TimePoint t0 = Clock::now();
 
@@ -296,9 +422,12 @@ static bool loadObj(const char *path, Mesh &out) {
 
   out.bmin[0] = out.bmin[1] = out.bmin[2] = 1e30f;
   out.bmax[0] = out.bmax[1] = out.bmax[2] = -1e30f;
+  out.legacyObjectFallback = legacyObjectFallback;
 
   char line[4096];
   std::string objectName;
+  std::string materialName;
+  NavSemantic currentSemantic = NavSemantic::Untagged;
   float objectMin[3] = {1e30f, 1e30f, 1e30f};
   float objectMax[3] = {-1e30f, -1e30f, -1e30f};
   size_t objectTriStart = 0;
@@ -335,14 +464,29 @@ static bool loadObj(const char *path, Mesh &out) {
         lower.rfind("common_props_wreckedcar", 0) == 0 ||
         lower.rfind("common_props_wreckedtruck", 0) == 0 ||
         lower.rfind("common_props_wreckedvan", 0) == 0;
-    const bool excluded = thinHospitalDecoration;
+    bool allFallbackTriangles = true;
+    for (size_t tri = objectTriStart / 3; tri < out.triangleSemantics.size();
+         ++tri) {
+      const NavSemantic semantic = out.triangleSemantics[tri];
+      if (semantic != NavSemantic::Untagged &&
+          semantic != NavSemantic::OrdinaryMaterial) {
+        allFallbackTriangles = false;
+        break;
+      }
+    }
+    // Historical object-name policy is intentionally opt-in and may only fill
+    // untagged legacy geometry. It never overrides semantic source material.
+    const bool applyLegacyObjectPolicy =
+        legacyObjectFallback && allFallbackTriangles;
+    const bool excluded = applyLegacyObjectPolicy && thinHospitalDecoration;
     if (excluded) {
       const size_t removed = (out.tris.size() - objectTriStart) / 3;
       out.tris.resize(objectTriStart);
       out.nonWalkableTris.resize(objectTriStart / 3);
+      out.triangleSemantics.resize(objectTriStart / 3);
       excludedHospitalDecorationObjects++;
       excludedHospitalDecorationTriangles += (long long)removed;
-    } else if (staticVehicleObstacle) {
+    } else if (applyLegacyObjectPolicy && staticVehicleObstacle) {
       const size_t firstTriangle = objectTriStart / 3;
       const size_t triangleCount = out.tris.size() / 3 - firstTriangle;
       std::fill(out.nonWalkableTris.begin() + firstTriangle,
@@ -376,6 +520,18 @@ static bool loadObj(const char *path, Mesh &out) {
       objectMin[0] = objectMin[1] = objectMin[2] = 1e30f;
       objectMax[0] = objectMax[1] = objectMax[2] = -1e30f;
       objectTriStart = out.tris.size();
+    } else if (strncmp(line, "usemtl", 6) == 0 &&
+               (line[6] == ' ' || line[6] == '\t')) {
+      char *name = line + 7;
+      while (*name == ' ' || *name == '\t')
+        ++name;
+      name[strcspn(name, "\r\n")] = '\0';
+      materialName = name;
+      currentSemantic = parseSemanticMaterial(materialName);
+      if (currentSemantic == NavSemantic::Invalid)
+        out.invalidSemanticMaterials.insert(materialName);
+      else if (currentSemantic != NavSemantic::OrdinaryMaterial)
+        out.semanticInput = true;
     } else if (line[0] == 'v' && line[1] == ' ') {
       float x, y, z;
       if (sscanf(line + 2, "%f %f %f", &x, &y, &z) == 3) {
@@ -415,15 +571,54 @@ static bool loadObj(const char *path, Mesh &out) {
           p++;
       }
       for (int i = 2; i < n; i++) {
+        out.sourceTriangles++;
+        const SemanticSpec *spec = semanticSpec(currentSemantic);
+        if (spec)
+          out.semanticHistogram[spec->material]++;
+        else if (currentSemantic == NavSemantic::OrdinaryMaterial) {
+          out.semanticHistogram["ordinary_material"]++;
+          out.ordinaryMaterialTriangles++;
+          out.fallbackTriangles++;
+        } else {
+          out.semanticHistogram["untagged"]++;
+          out.fallbackTriangles++;
+        }
+        if (spec && spec->exclude) {
+          out.excludedSemanticTriangles++;
+          continue;
+        }
         out.tris.push_back(idx[0]);
         out.tris.push_back(idx[i - 1]);
         out.tris.push_back(idx[i]);
         out.nonWalkableTris.push_back(0);
+        out.triangleSemantics.push_back(currentSemantic);
       }
     }
   }
   finishObject();
   fclose(f);
+
+  if (!out.invalidSemanticMaterials.empty()) {
+    fprintf(stderr, "  Unknown semantic material(s):");
+    for (const std::string &name : out.invalidSemanticMaterials)
+      fprintf(stderr, " %s", name.c_str());
+    fprintf(stderr, "\n");
+    return false;
+  }
+  if (!legacyObjectFallback && !out.semanticInput) {
+    fprintf(stderr,
+            "  OBJ has no %s materials; use --legacy-object-fallback only "
+            "for pre-semantic input\n",
+            SEMANTIC_CONTRACT);
+    return false;
+  }
+  if (!legacyObjectFallback && out.fallbackTriangles > 0) {
+    fprintf(stderr,
+            "  Semantic OBJ contains %lld untagged/ordinary-material "
+            "triangle(s); every face must use a canonical nav_* material\n",
+            out.fallbackTriangles);
+    return false;
+  }
 
   if (out.verts.empty() || out.tris.empty()) {
     fprintf(stderr, "  No geometry found in %s\n", path);
@@ -432,6 +627,17 @@ static bool loadObj(const char *path, Mesh &out) {
 
   printf("  %d verts, %d tris  (%.2fs)\n", (int)(out.verts.size() / 3),
          (int)(out.tris.size() / 3), elapsed(t0));
+  printf("  Semantics: contract=%s input=%s legacyFallback=%s source=%lld "
+         "excluded=%lld kept=%zu\n",
+         SEMANTIC_CONTRACT, out.semanticInput ? "true" : "false",
+         legacyObjectFallback ? "true" : "false", out.sourceTriangles,
+         out.excludedSemanticTriangles, out.triangleSemantics.size());
+  for (const auto &[name, count] : out.semanticHistogram)
+    printf("    %-24s %lld triangle(s)\n", name.c_str(), count);
+  if (out.semanticHistogram.count("nav_unknown"))
+    fprintf(stderr,
+            "  [WARN] nav_unknown rasterizes non-walkable; classify these "
+            "triangles before release\n");
   printf("  Excluded %d thin hospital decorations (%lld triangles)\n",
          excludedHospitalDecorationObjects,
          excludedHospitalDecorationTriangles);
@@ -440,6 +646,233 @@ static bool loadObj(const char *path, Mesh &out) {
   printf("  Bounds X [%.2f .. %.2f]  Y [%.2f .. %.2f]  Z [%.2f .. %.2f]\n",
          out.bmin[0], out.bmax[0], out.bmin[1], out.bmax[1], out.bmin[2],
          out.bmax[2]);
+  return true;
+}
+
+static std::string jsonEscape(const std::string &value) {
+  std::string out;
+  for (unsigned char c : value) {
+    switch (c) {
+    case '\\': out += "\\\\"; break;
+    case '"': out += "\\\""; break;
+    case '\n': out += "\\n"; break;
+    case '\r': out += "\\r"; break;
+    case '\t': out += "\\t"; break;
+    default:
+      if (c < 0x20) {
+        char escaped[7];
+        snprintf(escaped, sizeof(escaped), "\\u%04x", c);
+        out += escaped;
+      } else {
+        out += (char)c;
+      }
+    }
+  }
+  return out;
+}
+
+static std::string fnv1a64File(const char *path) {
+  std::ifstream input(path, std::ios::binary);
+  unsigned long long hash = 14695981039346656037ULL;
+  char buffer[64 * 1024];
+  while (input) {
+    input.read(buffer, sizeof(buffer));
+    const std::streamsize count = input.gcount();
+    for (std::streamsize i = 0; i < count; ++i) {
+      hash ^= (unsigned char)buffer[i];
+      hash *= 1099511628211ULL;
+    }
+  }
+  std::ostringstream result;
+  result << std::hex << std::setw(16) << std::setfill('0') << hash;
+  return result.str();
+}
+
+static bool writeSemanticReport(const char *inputPath, const std::string &path,
+                                const Mesh &mesh) {
+  const std::filesystem::path reportPath(path);
+  if (!reportPath.parent_path().empty()) {
+    std::error_code error;
+    std::filesystem::create_directories(reportPath.parent_path(), error);
+    if (error) {
+      fprintf(stderr, "Cannot create semantic report directory: %s\n",
+              error.message().c_str());
+      return false;
+    }
+  }
+  std::ofstream report(reportPath, std::ios::binary | std::ios::trunc);
+  if (!report) {
+    fprintf(stderr, "Cannot write semantic report %s\n", path.c_str());
+    return false;
+  }
+  std::error_code sizeError;
+  const auto inputBytes = std::filesystem::file_size(inputPath, sizeError);
+  report << "{\n"
+         << "  \"schemaVersion\": 1,\n"
+         << "  \"semanticContract\": \"" << SEMANTIC_CONTRACT << "\",\n"
+         << "  \"inputPath\": \"" << jsonEscape(inputPath) << "\",\n"
+         << "  \"inputBytes\": " << (sizeError ? 0 : inputBytes) << ",\n"
+         << "  \"inputFnv1a64\": \"" << fnv1a64File(inputPath) << "\",\n"
+         << "  \"semanticInput\": " << (mesh.semanticInput ? "true" : "false")
+         << ",\n"
+         << "  \"legacyObjectFallback\": "
+         << (mesh.legacyObjectFallback ? "true" : "false") << ",\n"
+         << "  \"sourceTriangles\": " << mesh.sourceTriangles << ",\n"
+         << "  \"keptTriangles\": " << mesh.triangleSemantics.size() << ",\n"
+         << "  \"excludedTriangles\": " << mesh.excludedSemanticTriangles
+         << ",\n"
+         << "  \"fallbackTriangles\": " << mesh.fallbackTriangles << ",\n"
+         << "  \"ordinaryMaterialTriangles\": "
+         << mesh.ordinaryMaterialTriangles << ",\n"
+         << "  \"materials\": {\n";
+  bool first = true;
+  for (const auto &[name, count] : mesh.semanticHistogram) {
+    if (!first)
+      report << ",\n";
+    first = false;
+    report << "    \"" << jsonEscape(name) << "\": " << count;
+  }
+  report << "\n  },\n  \"taxonomy\": [\n";
+  for (size_t i = 0; i < sizeof(SEMANTIC_SPECS) / sizeof(SEMANTIC_SPECS[0]);
+       ++i) {
+    const SemanticSpec &spec = SEMANTIC_SPECS[i];
+    report << "    {\"material\": \"" << spec.material << "\", \"area\": "
+           << (int)spec.area << ", \"flags\": " << spec.flags
+           << ", \"rasterizeNull\": "
+           << (spec.rasterizeNull ? "true" : "false")
+           << ", \"exclude\": " << (spec.exclude ? "true" : "false") << "}";
+    if (i + 1 != sizeof(SEMANTIC_SPECS) / sizeof(SEMANTIC_SPECS[0]))
+      report << ',';
+    report << '\n';
+  }
+  report << "  ],\n  \"warnings\": [";
+  bool warning = false;
+  if (mesh.semanticHistogram.count("nav_unknown")) {
+    report << "\"nav_unknown triangles rasterize non-walkable\"";
+    warning = true;
+  }
+  if (mesh.fallbackTriangles > 0) {
+    if (warning)
+      report << ", ";
+    report << "\"legacy fallback triangles are not semantically classified\"";
+  }
+  report << "]\n}\n";
+  printf("  Semantic provenance: %s\n", path.c_str());
+  return true;
+}
+
+static bool validateSemanticContract(const Mesh &mesh, bool requireAll) {
+  if (mesh.tris.size() / 3 != mesh.triangleSemantics.size() ||
+      mesh.triangleSemantics.size() != mesh.nonWalkableTris.size()) {
+    fprintf(stderr, "Semantic validation failed: triangle arrays are misaligned\n");
+    return false;
+  }
+  for (const SemanticSpec &spec : SEMANTIC_SPECS) {
+    if (spec.area != RC_NULL_AREA && flagsForArea(spec.area) != spec.flags) {
+      fprintf(stderr,
+              "Semantic validation failed: %s area=%u maps to flags=%u, "
+              "expected=%u\n",
+              spec.material, spec.area, flagsForArea(spec.area), spec.flags);
+      return false;
+    }
+    if (requireAll && !mesh.semanticHistogram.count(spec.material)) {
+      fprintf(stderr, "Semantic validation failed: fixture lacks %s\n",
+              spec.material);
+      return false;
+    }
+  }
+  if (mesh.semanticInput && !mesh.legacyObjectFallback &&
+      mesh.fallbackTriangles != 0) {
+    fprintf(stderr,
+            "Semantic validation failed: strict semantic input used fallback\n");
+    return false;
+  }
+  printf("Semantic contract validation PASS (%s, %lld source triangles)\n",
+         SEMANTIC_CONTRACT, mesh.sourceTriangles);
+  return true;
+}
+
+struct RasterTriangles {
+  std::vector<int> indices;
+  std::vector<unsigned char> areas;
+};
+
+// This is the single semantic-to-Recast mapping used by both the direct
+// navmesh and TileCache builders. Keeping slope marking and semantic overrides
+// here prevents the two output paths from assigning different areas.
+static RasterTriangles prepareRasterTriangles(rcContext *ctx, const Mesh &mesh,
+                                               const std::vector<int> &triIds,
+                                               float walkableSlopeAngle) {
+  RasterTriangles raster;
+  raster.indices.reserve(triIds.size() * 3);
+  for (int triId : triIds) {
+    raster.indices.push_back(mesh.tris[triId * 3 + 0]);
+    raster.indices.push_back(mesh.tris[triId * 3 + 1]);
+    raster.indices.push_back(mesh.tris[triId * 3 + 2]);
+  }
+  raster.areas.assign(triIds.size(), RC_NULL_AREA);
+  rcMarkWalkableTriangles(ctx, walkableSlopeAngle, mesh.verts.data(),
+                          (int)(mesh.verts.size() / 3), raster.indices.data(),
+                          (int)triIds.size(), raster.areas.data());
+  for (size_t i = 0; i < triIds.size(); ++i) {
+    const int sourceTri = triIds[i];
+    if (mesh.nonWalkableTris[sourceTri]) {
+      raster.areas[i] = RC_NULL_AREA;
+      continue;
+    }
+    const SemanticSpec *spec = semanticSpec(mesh.triangleSemantics[sourceTri]);
+    if (spec && spec->rasterizeNull) {
+      raster.areas[i] = RC_NULL_AREA;
+      continue;
+    }
+    if (raster.areas[i] == RC_NULL_AREA)
+      continue; // semantics never override the configured slope limit
+    raster.areas[i] = spec ? spec->area : NAV_AREA_TERRAIN;
+  }
+  return raster;
+}
+
+static bool validateSemanticRasterMapping(const Mesh &mesh) {
+  std::vector<int> triIds(mesh.triangleSemantics.size());
+  for (size_t i = 0; i < triIds.size(); ++i)
+    triIds[i] = (int)i;
+  PrintContext ctx;
+  const RasterTriangles raster =
+      prepareRasterTriangles(&ctx, mesh, triIds, AGENT_MAX_SLOPE);
+  std::map<unsigned int, long long> areaHistogram;
+  std::map<unsigned int, long long> flagHistogram;
+  for (size_t i = 0; i < triIds.size(); ++i) {
+    const unsigned char area = raster.areas[i];
+    const unsigned short flags = flagsForArea(area);
+    areaHistogram[area]++;
+    flagHistogram[flags]++;
+    const SemanticSpec *spec = semanticSpec(mesh.triangleSemantics[i]);
+    if (mesh.nonWalkableTris[i] || (spec && spec->rasterizeNull)) {
+      if (area != RC_NULL_AREA) {
+        fprintf(stderr,
+                "Semantic raster validation failed: triangle %zu must be "
+                "non-walkable\n",
+                i);
+        return false;
+      }
+      continue;
+    }
+    const unsigned char expectedArea = spec ? spec->area : NAV_AREA_TERRAIN;
+    if (area != expectedArea || flags != flagsForArea(expectedArea)) {
+      fprintf(stderr,
+              "Semantic raster validation failed: triangle %zu area=%u "
+              "flags=%u expected area=%u flags=%u\n",
+              i, area, flags, expectedArea, flagsForArea(expectedArea));
+      return false;
+    }
+  }
+  printf("Semantic raster areas:");
+  for (const auto &[area, count] : areaHistogram)
+    printf(" %u=%lld", area, count);
+  printf("\nSemantic polygon flags:");
+  for (const auto &[flags, count] : flagHistogram)
+    printf(" 0x%02x=%lld", flags, count);
+  printf("\nSemantic raster validation PASS (shared direct/tile-cache mapping)\n");
   return true;
 }
 
@@ -493,23 +926,11 @@ static unsigned char *buildTile(rcContext *ctx, const Mesh &mesh,
   const float *verts = mesh.verts.data();
   const int nVerts = (int)(mesh.verts.size() / 3);
 
-  std::vector<int> nodeTris;
-  nodeTris.reserve(triIds.size() * 3);
-  for (int i : triIds) {
-    nodeTris.push_back(mesh.tris[i * 3 + 0]);
-    nodeTris.push_back(mesh.tris[i * 3 + 1]);
-    nodeTris.push_back(mesh.tris[i * 3 + 2]);
-  }
   const int nTris = (int)triIds.size();
-  std::vector<unsigned char> areas(nTris, 0);
-  rcMarkWalkableTriangles(ctx, cfg.walkableSlopeAngle, verts, nVerts,
-                          nodeTris.data(), nTris, areas.data());
-  for (int i = 0; i < nTris; i++) {
-    if (mesh.nonWalkableTris[triIds[i]])
-      areas[i] = RC_NULL_AREA;
-  }
-  rcRasterizeTriangles(ctx, verts, nVerts, nodeTris.data(), areas.data(), nTris,
-                       *hf, cfg.walkableClimb);
+  const RasterTriangles raster =
+      prepareRasterTriangles(ctx, mesh, triIds, cfg.walkableSlopeAngle);
+  rcRasterizeTriangles(ctx, verts, nVerts, raster.indices.data(),
+                       raster.areas.data(), nTris, *hf, cfg.walkableClimb);
 
   rcFilterLowHangingWalkableObstacles(ctx, cfg.walkableClimb, *hf);
   rcFilterLedgeSpans(ctx, cfg.walkableHeight, cfg.walkableClimb, *hf);
@@ -586,7 +1007,7 @@ static unsigned char *buildTile(rcContext *ctx, const Mesh &mesh,
   }
 
   for (int i = 0; i < pmesh->npolys; ++i)
-    pmesh->flags[i] = 1; // walkable
+    pmesh->flags[i] = flagsForArea(pmesh->areas[i]);
 
   dtNavMeshCreateParams params{};
   params.verts = pmesh->verts;
@@ -679,23 +1100,11 @@ buildTileCacheLayers(rcContext *ctx, const Mesh &mesh, const TriGrid &grid,
   const float *verts = mesh.verts.data();
   const int nVerts = (int)(mesh.verts.size() / 3);
 
-  std::vector<int> nodeTris;
-  nodeTris.reserve(triIds.size() * 3);
-  for (int i : triIds) {
-    nodeTris.push_back(mesh.tris[i * 3 + 0]);
-    nodeTris.push_back(mesh.tris[i * 3 + 1]);
-    nodeTris.push_back(mesh.tris[i * 3 + 2]);
-  }
   const int nTris = (int)triIds.size();
-  std::vector<unsigned char> areas(nTris, 0);
-  rcMarkWalkableTriangles(ctx, cfg.walkableSlopeAngle, verts, nVerts,
-                          nodeTris.data(), nTris, areas.data());
-  for (int i = 0; i < nTris; i++) {
-    if (mesh.nonWalkableTris[triIds[i]])
-      areas[i] = RC_NULL_AREA;
-  }
-  rcRasterizeTriangles(ctx, verts, nVerts, nodeTris.data(), areas.data(), nTris,
-                       *hf, cfg.walkableClimb);
+  const RasterTriangles raster =
+      prepareRasterTriangles(ctx, mesh, triIds, cfg.walkableSlopeAngle);
+  rcRasterizeTriangles(ctx, verts, nVerts, raster.indices.data(),
+                       raster.areas.data(), nTris, *hf, cfg.walkableClimb);
 
   rcFilterLowHangingWalkableObstacles(ctx, cfg.walkableClimb, *hf);
   rcFilterLedgeSpans(ctx, cfg.walkableHeight, cfg.walkableClimb, *hf);
@@ -782,6 +1191,10 @@ static void printUsage(const char *program) {
           "  --region-merge <voxels>     Region merge size\n"
           "  --bounds <minX> <minZ> <maxX> <maxZ>\n"
           "                              Build only intersecting global tiles\n"
+          "  --legacy-object-fallback   Enable pre-semantic object-name rules\n"
+          "  --semantic-report <path>  Write deterministic semantic provenance\n"
+          "  --validate-semantics-only Parse/report semantics without baking\n"
+          "  --require-all-semantics    Require every canonical tag (fixtures)\n"
           "\n"
           "The human profile uses cs=.2, ch=.1, radius=.2, climb=1.3,\n"
           "slope=45, tile=128, region-min=8, and region-merge=20.\n",
@@ -824,7 +1237,7 @@ static bool applyProfile(const char *name) {
 }
 
 static bool parseOptions(int argc, char *argv[], int start,
-                         BuildBounds &bounds) {
+                         BuildOptions &options) {
   for (int i = start; i < argc; ++i) {
     if (strcmp(argv[i], "--profile") == 0) {
       if (++i >= argc || !applyProfile(argv[i]))
@@ -843,15 +1256,35 @@ static bool parseOptions(int argc, char *argv[], int start,
       return false;
     }
     if (strcmp(arg, "--bounds") == 0) {
-      if (i + 4 >= argc || !parseFloat(argv[i + 1], bounds.minX) ||
-          !parseFloat(argv[i + 2], bounds.minZ) ||
-          !parseFloat(argv[i + 3], bounds.maxX) ||
-          !parseFloat(argv[i + 4], bounds.maxZ)) {
+      if (i + 4 >= argc || !parseFloat(argv[i + 1], options.bounds.minX) ||
+          !parseFloat(argv[i + 2], options.bounds.minZ) ||
+          !parseFloat(argv[i + 3], options.bounds.maxX) ||
+          !parseFloat(argv[i + 4], options.bounds.maxZ)) {
         fprintf(stderr, "Invalid --bounds values\n");
         return false;
       }
-      bounds.enabled = true;
+      options.bounds.enabled = true;
       i += 4;
+      continue;
+    }
+    if (strcmp(arg, "--legacy-object-fallback") == 0) {
+      options.legacyObjectFallback = true;
+      continue;
+    }
+    if (strcmp(arg, "--validate-semantics-only") == 0) {
+      options.validateSemanticsOnly = true;
+      continue;
+    }
+    if (strcmp(arg, "--require-all-semantics") == 0) {
+      options.requireAllSemantics = true;
+      continue;
+    }
+    if (strcmp(arg, "--semantic-report") == 0) {
+      if (++i >= argc) {
+        fprintf(stderr, "Missing value for --semantic-report\n");
+        return false;
+      }
+      options.semanticReportPath = argv[i];
       continue;
     }
 
@@ -904,8 +1337,9 @@ static bool parseOptions(int argc, char *argv[], int start,
     fprintf(stderr, "Invalid build configuration\n");
     return false;
   }
-  if (bounds.enabled &&
-      (bounds.minX >= bounds.maxX || bounds.minZ >= bounds.maxZ)) {
+  if (options.bounds.enabled &&
+      (options.bounds.minX >= options.bounds.maxX ||
+       options.bounds.minZ >= options.bounds.maxZ)) {
     fprintf(stderr, "Invalid build bounds\n");
     return false;
   }
@@ -930,15 +1364,25 @@ int main(int argc, char *argv[]) {
       outputPath = outputPath.substr(0, dot);
     outputPath += ".bin";
   }
-  BuildBounds bounds;
-  if (!parseOptions(argc, argv, optionStart, bounds))
+  BuildOptions options;
+  if (!parseOptions(argc, argv, optionStart, options))
     return 1;
 
   TimePoint tTotal = Clock::now();
 
   Mesh mesh;
-  if (!loadObj(inputPath, mesh))
+  if (!loadObj(inputPath, mesh, options.legacyObjectFallback))
     return 1;
+  if (options.semanticReportPath.empty())
+    options.semanticReportPath = outputPath + ".semantics.json";
+  if (!writeSemanticReport(inputPath, options.semanticReportPath, mesh) ||
+      !validateSemanticContract(mesh, options.requireAllSemantics))
+    return 1;
+  if (options.validateSemanticsOnly) {
+    if (!validateSemanticRasterMapping(mesh))
+      return 1;
+    return 0;
+  }
 
   printf("Building spatial index...");
   fflush(stdout);
@@ -958,15 +1402,19 @@ int main(int argc, char *argv[]) {
   int firstTy = 0;
   int lastTx = tw;
   int lastTy = th;
-  if (bounds.enabled) {
+  if (options.bounds.enabled) {
     firstTx = std::clamp(
-        (int)floorf((bounds.minX - mesh.bmin[0]) / tileWorldSize), 0, tw);
+        (int)floorf((options.bounds.minX - mesh.bmin[0]) / tileWorldSize), 0,
+        tw);
     firstTy = std::clamp(
-        (int)floorf((bounds.minZ - mesh.bmin[2]) / tileWorldSize), 0, th);
+        (int)floorf((options.bounds.minZ - mesh.bmin[2]) / tileWorldSize), 0,
+        th);
     lastTx = std::clamp(
-        (int)ceilf((bounds.maxX - mesh.bmin[0]) / tileWorldSize), 0, tw);
+        (int)ceilf((options.bounds.maxX - mesh.bmin[0]) / tileWorldSize), 0,
+        tw);
     lastTy = std::clamp(
-        (int)ceilf((bounds.maxZ - mesh.bmin[2]) / tileWorldSize), 0, th);
+        (int)ceilf((options.bounds.maxZ - mesh.bmin[2]) / tileWorldSize), 0,
+        th);
   }
   const int totalTiles = (lastTx - firstTx) * (lastTy - firstTy);
   if (totalTiles <= 0) {
