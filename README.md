@@ -29,7 +29,7 @@ navmesh/tilecache data.
 
 `--profile human` selects the fine streaming configuration used by h1emu:
 0.2-meter horizontal cells, 0.1-meter vertical cells, 0.2-meter agent radius,
-0.5-meter climb, 45-degree slope, and 128-voxel tiles. The reduced erosion is
+1.3-meter climb, 45-degree slope, and 128-voxel tiles. The reduced erosion is
 required to retain the original game's narrow interior doorways.
 
 Use `--bounds minX minZ maxX maxZ` for repeatable regional validation before a

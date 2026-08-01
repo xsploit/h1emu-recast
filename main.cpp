@@ -260,9 +260,19 @@ static unsigned int ilog2(unsigned int v) {
   return r | (v >> 1);
 }
 
+struct NonWalkableVolume {
+  float bmin[3];
+  float bmax[3];
+};
+
 struct Mesh {
   std::vector<float> verts; // x,y,z triples
   std::vector<int> tris;    // 0-based triangle indices
+  // Parallel to tris (one entry per triangle). These triangles still
+  // rasterize into the heightfield as solid geometry, but their upward faces
+  // must never become walkable navmesh.
+  std::vector<unsigned char> nonWalkableTris;
+  std::vector<NonWalkableVolume> nonWalkableVolumes;
   float bmin[3];
   float bmax[3];
 };
@@ -294,6 +304,8 @@ static bool loadObj(const char *path, Mesh &out) {
   size_t objectTriStart = 0;
   int excludedHospitalDecorationObjects = 0;
   long long excludedHospitalDecorationTriangles = 0;
+  int blockedStaticVehicleObjects = 0;
+  long long blockedStaticVehicleTriangles = 0;
   float debugMinX = 0.0f, debugMinZ = 0.0f, debugMaxX = 0.0f,
         debugMaxZ = 0.0f;
   const char *debugBounds = getenv("H1EMU_NAV_DEBUG_OBJECT_BOUNDS");
@@ -314,12 +326,36 @@ static bool loadObj(const char *path, Mesh &out) {
     const bool thinHospitalDecoration =
         lower.rfind("hospital_props_ceilinglight", 0) == 0 ||
         lower.rfind("hospital_props_paperdebris", 0) == 0;
+    // Wrecked cars are authored world blockers, not traversal surfaces. Their
+    // roofs are shallow enough to pass rcMarkWalkableTriangles and, with the
+    // human climb profile, become connected islands that elevator NPCs onto
+    // vehicles. Keep the full shell in the heightfield but force every face to
+    // RC_NULL_AREA so it carves clearance without producing walkable polys.
+    const bool staticVehicleObstacle =
+        lower.rfind("common_props_wreckedcar", 0) == 0 ||
+        lower.rfind("common_props_wreckedtruck", 0) == 0 ||
+        lower.rfind("common_props_wreckedvan", 0) == 0;
     const bool excluded = thinHospitalDecoration;
     if (excluded) {
       const size_t removed = (out.tris.size() - objectTriStart) / 3;
       out.tris.resize(objectTriStart);
+      out.nonWalkableTris.resize(objectTriStart / 3);
       excludedHospitalDecorationObjects++;
       excludedHospitalDecorationTriangles += (long long)removed;
+    } else if (staticVehicleObstacle) {
+      const size_t firstTriangle = objectTriStart / 3;
+      const size_t triangleCount = out.tris.size() / 3 - firstTriangle;
+      std::fill(out.nonWalkableTris.begin() + firstTriangle,
+                out.nonWalkableTris.end(), static_cast<unsigned char>(1));
+      blockedStaticVehicleObjects++;
+      blockedStaticVehicleTriangles += (long long)triangleCount;
+      NonWalkableVolume volume{};
+      rcVcopy(volume.bmin, objectMin);
+      rcVcopy(volume.bmax, objectMax);
+      // Include the roof raster span and let normal navmesh erosion provide
+      // the agent-radius clearance around the obstacle footprint.
+      volume.bmax[1] += CELL_HEIGHT * 2.0f;
+      out.nonWalkableVolumes.push_back(volume);
     }
     if (debugObjects && !excluded && objectMax[0] >= debugMinX &&
         objectMin[0] <= debugMaxX && objectMax[2] >= debugMinZ &&
@@ -382,6 +418,7 @@ static bool loadObj(const char *path, Mesh &out) {
         out.tris.push_back(idx[0]);
         out.tris.push_back(idx[i - 1]);
         out.tris.push_back(idx[i]);
+        out.nonWalkableTris.push_back(0);
       }
     }
   }
@@ -398,6 +435,8 @@ static bool loadObj(const char *path, Mesh &out) {
   printf("  Excluded %d thin hospital decorations (%lld triangles)\n",
          excludedHospitalDecorationObjects,
          excludedHospitalDecorationTriangles);
+  printf("  Marked %d static vehicle props non-walkable (%lld triangles)\n",
+         blockedStaticVehicleObjects, blockedStaticVehicleTriangles);
   printf("  Bounds X [%.2f .. %.2f]  Y [%.2f .. %.2f]  Z [%.2f .. %.2f]\n",
          out.bmin[0], out.bmax[0], out.bmin[1], out.bmax[1], out.bmin[2],
          out.bmax[2]);
@@ -465,6 +504,10 @@ static unsigned char *buildTile(rcContext *ctx, const Mesh &mesh,
   std::vector<unsigned char> areas(nTris, 0);
   rcMarkWalkableTriangles(ctx, cfg.walkableSlopeAngle, verts, nVerts,
                           nodeTris.data(), nTris, areas.data());
+  for (int i = 0; i < nTris; i++) {
+    if (mesh.nonWalkableTris[triIds[i]])
+      areas[i] = RC_NULL_AREA;
+  }
   rcRasterizeTriangles(ctx, verts, nVerts, nodeTris.data(), areas.data(), nTris,
                        *hf, cfg.walkableClimb);
 
@@ -480,6 +523,13 @@ static unsigned char *buildTile(rcContext *ctx, const Mesh &mesh,
     return nullptr;
   }
   rcFreeHeightField(hf);
+
+  for (const NonWalkableVolume &volume : mesh.nonWalkableVolumes) {
+    if (volume.bmax[0] < cfg.bmin[0] || volume.bmin[0] > cfg.bmax[0] ||
+        volume.bmax[2] < cfg.bmin[2] || volume.bmin[2] > cfg.bmax[2])
+      continue;
+    rcMarkBoxArea(ctx, volume.bmin, volume.bmax, RC_NULL_AREA, *chf);
+  }
 
   if (!rcErodeWalkableArea(ctx, cfg.walkableRadius, *chf)) {
     rcFreeCompactHeightfield(chf);
@@ -640,6 +690,10 @@ buildTileCacheLayers(rcContext *ctx, const Mesh &mesh, const TriGrid &grid,
   std::vector<unsigned char> areas(nTris, 0);
   rcMarkWalkableTriangles(ctx, cfg.walkableSlopeAngle, verts, nVerts,
                           nodeTris.data(), nTris, areas.data());
+  for (int i = 0; i < nTris; i++) {
+    if (mesh.nonWalkableTris[triIds[i]])
+      areas[i] = RC_NULL_AREA;
+  }
   rcRasterizeTriangles(ctx, verts, nVerts, nodeTris.data(), areas.data(), nTris,
                        *hf, cfg.walkableClimb);
 
@@ -655,6 +709,13 @@ buildTileCacheLayers(rcContext *ctx, const Mesh &mesh, const TriGrid &grid,
     return result;
   }
   rcFreeHeightField(hf);
+
+  for (const NonWalkableVolume &volume : mesh.nonWalkableVolumes) {
+    if (volume.bmax[0] < cfg.bmin[0] || volume.bmin[0] > cfg.bmax[0] ||
+        volume.bmax[2] < cfg.bmin[2] || volume.bmin[2] > cfg.bmax[2])
+      continue;
+    rcMarkBoxArea(ctx, volume.bmin, volume.bmax, RC_NULL_AREA, *chf);
+  }
 
   if (!rcErodeWalkableArea(ctx, cfg.walkableRadius, *chf)) {
     rcFreeCompactHeightfield(chf);
