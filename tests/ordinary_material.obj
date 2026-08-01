@@ -1,0 +1,11 @@
+o mixed_materials
+v 0 0 0
+v 1 0 0
+v 0 0 1
+v 2 0 0
+v 3 0 0
+v 2 0 1
+usemtl nav_terrain
+f 1 3 2
+usemtl brick
+f 4 6 5
