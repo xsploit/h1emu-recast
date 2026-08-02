@@ -1,0 +1,39 @@
+# A large walkable slope passes above a small buried obstacle shell. The
+# obstacle probe lies near the high side of the polygon, where the local
+# surface is much higher than the polygon's vertex-average height. Semantic
+# verification must sample the polygon at the probe instead of comparing the
+# obstacle against that unrelated average.
+o sloped_terrain
+v 0 0 0
+v 12 6 0
+v 12 6 10
+v 0 0 10
+usemtl nav_terrain
+f 1 4 3
+f 1 3 2
+
+# This box is entirely below the terrain around x=9 (terrain y=4.5). Its
+# horizontal faces remain valid obstacle probes, but they must not invalidate
+# the distinct walkable surface above them.
+o buried_boulder_shell
+v 8.8 3.8 4.8
+v 9.2 3.8 4.8
+v 9.2 3.8 5.2
+v 8.8 3.8 5.2
+v 8.8 4.0 4.8
+v 9.2 4.0 4.8
+v 9.2 4.0 5.2
+v 8.8 4.0 5.2
+usemtl nav_obstacle_static
+f 5 6 7
+f 5 7 8
+f 9 12 11
+f 9 11 10
+f 5 9 10
+f 5 10 6
+f 6 10 11
+f 6 11 7
+f 7 11 12
+f 7 12 8
+f 8 12 9
+f 8 9 5
