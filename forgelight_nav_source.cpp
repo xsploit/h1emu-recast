@@ -206,6 +206,27 @@ bool isProductionForbidden(SemanticId id) {
   return id == SemanticId::Terrain || id == SemanticId::Unknown;
 }
 
+bool isCompatible(CollisionKind kind, SemanticId semantic,
+                  bool strictProduction) {
+  if (!strictProduction &&
+      (semantic == SemanticId::Terrain || semantic == SemanticId::Unknown))
+    return true;
+  switch (kind) {
+  case CollisionKind::Walkable:
+    return (semantic >= SemanticId::Road &&
+            semantic <= SemanticId::ObstacleStatic) ||
+           semantic == SemanticId::Exclude;
+  case CollisionKind::Solid:
+    return semantic == SemanticId::ObstacleStatic;
+  case CollisionKind::Thin:
+    return semantic == SemanticId::ObstacleStatic ||
+           semantic == SemanticId::Exclude;
+  case CollisionKind::Door:
+    return semantic == SemanticId::DoorPanelDynamic;
+  }
+  return false;
+}
+
 } // namespace
 
 std::vector<std::uint32_t> H1Col2Document::meshTriangleCounts() const {
@@ -424,8 +445,33 @@ H1Sem1Document parseH1Sem1(
 H1Sem1Document loadH1Sem1(const std::filesystem::path &path,
                           const H1Col2Document &collision,
                           bool strictProduction) {
-  return parseH1Sem1(readFileBytes(path), collision.sha256,
-                     collision.meshTriangleCounts(), strictProduction);
+  H1Sem1Document semantics =
+      parseH1Sem1(readFileBytes(path), collision.sha256,
+                  collision.meshTriangleCounts(), strictProduction);
+  validateH1Sem1Compatibility(collision, semantics, strictProduction);
+  return semantics;
+}
+
+void validateH1Sem1Compatibility(const H1Col2Document &collision,
+                                 const H1Sem1Document &semantics,
+                                 bool strictProduction) {
+  if (collision.meshes.size() != semantics.meshCount())
+    throw std::runtime_error("H1SEM1 compatibility mesh count mismatch");
+  for (std::size_t meshIndex = 0; meshIndex < collision.meshes.size();
+       ++meshIndex) {
+    const std::uint32_t start = semantics.meshOffsets[meshIndex];
+    const std::uint32_t end = semantics.meshOffsets[meshIndex + 1];
+    for (std::uint32_t triangleIndex = start; triangleIndex < end;
+         ++triangleIndex) {
+      const SemanticId semantic = semantics.semantics[triangleIndex];
+      if (!isCompatible(collision.meshes[meshIndex].kind, semantic,
+                        strictProduction))
+        throw std::runtime_error(
+            "H1SEM1 semantic is incompatible with H1COL2 kind at mesh " +
+            std::to_string(meshIndex) + ", triangle " +
+            std::to_string(triangleIndex - start));
+    }
+  }
 }
 
 HeightmapRgb::HeightmapRgb(std::uint32_t width, std::uint32_t height,

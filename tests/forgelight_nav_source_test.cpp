@@ -170,6 +170,17 @@ int main() {
                 semantics.semantics[0] == SemanticId::Road &&
                 semantics.semantics[1] == SemanticId::ObstacleStatic,
             "H1SEM1 decode mismatch");
+    validateH1Sem1Compatibility(collision, semantics, true);
+    H1Sem1Document unsafeKind = semantics;
+    unsafeKind.semantics[1] = SemanticId::Exclude;
+    expectFailure("solid H1COL2 kind with exclude semantic", [&] {
+      validateH1Sem1Compatibility(collision, unsafeKind, true);
+    });
+    unsafeKind = semantics;
+    unsafeKind.semantics[1] = SemanticId::DoorPanelDynamic;
+    expectFailure("solid H1COL2 kind with door semantic", [&] {
+      validateH1Sem1Compatibility(collision, unsafeKind, true);
+    });
 
     auto badDigest = semanticBytes;
     badDigest[32] ^= 1;

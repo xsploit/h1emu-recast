@@ -79,6 +79,9 @@ H1Sem1Document parseH1Sem1(
     const Sha256Digest &expectedCollisionSha256,
     const std::vector<std::uint32_t> &expectedMeshTriangleCounts,
     bool strictProduction);
+void validateH1Sem1Compatibility(const H1Col2Document &collision,
+                                 const H1Sem1Document &semantics,
+                                 bool strictProduction);
 H1Sem1Document loadH1Sem1(
     const std::filesystem::path &path,
     const H1Col2Document &collision,
