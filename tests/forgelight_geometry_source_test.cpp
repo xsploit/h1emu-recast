@@ -224,6 +224,80 @@ int main() {
       require(source.semanticInput(), "semanticInput must be true");
     }
 
+    // Terrain: a flat (height=0 everywhere, via a 1x1 heightmap that every
+    // world coordinate clamps to) lattice with zero H1COL2 instances at all
+    // must still produce walkable Terrain geometry -- terrain covers the
+    // world independent of props.
+    {
+      H1Col2Document emptyCollision;
+      H1Sem1Document emptySemantics;
+      emptySemantics.meshOffsets = {0};
+      const HeightmapRgb flatHeightmap(1, 1, {16, 0, 0});
+      ForgelightGeometrySource source(emptyCollision, emptySemantics,
+                                      worldBmin, worldBmax, 25.6f,
+                                      &flatHeightmap, 4.0f);
+      TileRasterInput out;
+      require(source.queryTile(qmin, qmax, out),
+              "expected terrain geometry with zero instances");
+      require(!out.tris.empty() && out.tris.size() % 3 == 0,
+              "expected a nonempty, well-formed terrain triangle list");
+      for (std::size_t i = 0; i < out.triangleSemantics.size(); ++i) {
+        require(out.triangleSemantics[i] == NavSemantic::Terrain,
+                "terrain triangle should be classified Terrain");
+        require(out.triangleObjects[i] == -1,
+                "terrain triangle should use the -1 no-instance sentinel");
+      }
+      // Every terrain vertex should be flat (height 0) and every triangle
+      // should present an upward (+Y) normal, verified independently of
+      // the hand-derived winding comment in forgelight_terrain_lattice.cpp.
+      for (std::size_t tri = 0; tri < out.tris.size() / 3; ++tri) {
+        const float *v0 = &out.verts[out.tris[tri * 3 + 0] * 3];
+        const float *v1 = &out.verts[out.tris[tri * 3 + 1] * 3];
+        const float *v2 = &out.verts[out.tris[tri * 3 + 2] * 3];
+        require(v0[1] == 0.0f && v1[1] == 0.0f && v2[1] == 0.0f,
+                "flat heightmap should produce Y=0 terrain everywhere");
+        const float e1[3] = {v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]};
+        const float e2[3] = {v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]};
+        const float normalY = e1[2] * e2[0] - e1[0] * e2[2];
+        require(normalY > 0.0f,
+                "terrain triangle must present an upward-facing normal");
+      }
+    }
+
+    // The terrain lattice is fixed at construction: querying the same
+    // region twice must yield byte-identical triangle data (no re-anchoring
+    // per query).
+    {
+      H1Col2Document emptyCollision;
+      H1Sem1Document emptySemantics;
+      emptySemantics.meshOffsets = {0};
+      const HeightmapRgb flatHeightmap(1, 1, {20, 8, 0});
+      ForgelightGeometrySource source(emptyCollision, emptySemantics,
+                                      worldBmin, worldBmax, 25.6f,
+                                      &flatHeightmap, 4.0f);
+      TileRasterInput first;
+      TileRasterInput second;
+      require(source.queryTile(qmin, qmax, first) &&
+                  source.queryTile(qmin, qmax, second),
+              "expected terrain geometry on both queries");
+      require(first.verts == second.verts && first.tris == second.tris,
+              "repeated queryTile on a fixed lattice must be deterministic");
+    }
+
+    // Without a heightmap, zero instances must still report no geometry
+    // (regression check that terrain support didn't change the no-terrain
+    // default behavior already covered above).
+    {
+      H1Col2Document emptyCollision;
+      H1Sem1Document emptySemantics;
+      emptySemantics.meshOffsets = {0};
+      ForgelightGeometrySource source(emptyCollision, emptySemantics,
+                                      worldBmin, worldBmax);
+      TileRasterInput out;
+      require(!source.queryTile(qmin, qmax, out),
+              "no heightmap and no instances should report no geometry");
+    }
+
     // Mesh-count mismatch between H1COL2 and H1SEM1 must fail closed.
     {
       const H1Col2Document collision = makeSingleTriangleCollision(false);

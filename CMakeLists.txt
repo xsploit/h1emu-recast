@@ -18,6 +18,7 @@ add_library(forgelight-nav-source STATIC
     forgelight_nav_source.cpp
     forgelight_heightmap_loader.cpp
     forgelight_instance_index.cpp
+    forgelight_terrain_lattice.cpp
     forgelight_geometry_source.cpp
 )
 target_include_directories(forgelight-nav-source PUBLIC ${CMAKE_SOURCE_DIR})

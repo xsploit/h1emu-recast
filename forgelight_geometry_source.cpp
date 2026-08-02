@@ -79,7 +79,8 @@ NavSemantic mapSemanticId(SemanticId id) {
 ForgelightGeometrySource::ForgelightGeometrySource(
     const H1Col2Document &collision, const H1Sem1Document &semantics,
     const float worldBmin[3], const float worldBmax[3],
-    float instanceCellSize)
+    float instanceCellSize, const h1emu::nav::HeightmapRgb *heightmap,
+    float terrainSpacing)
     : collision_(collision), semantics_(semantics) {
   if (semantics_.meshCount() != collision_.meshes.size())
     throw std::runtime_error(
@@ -90,6 +91,10 @@ ForgelightGeometrySource::ForgelightGeometrySource(
   const float worldBmaxXZ[2] = {worldBmax[0], worldBmax[2]};
   instanceIndex_.build(collision_, worldBminXZ, worldBmaxXZ,
                        instanceCellSize);
+  if (heightmap) {
+    terrainLattice_ = std::make_unique<TerrainLattice>(
+        *heightmap, worldBminXZ, worldBmaxXZ, terrainSpacing);
+  }
 }
 
 void ForgelightGeometrySource::worldBounds(float bmin[3],
@@ -103,7 +108,9 @@ bool ForgelightGeometrySource::queryTile(const float qmin[2],
                                          TileRasterInput &out) const {
   const std::vector<std::uint32_t> instanceIds =
       instanceIndex_.query(qmin, qmax);
-  if (instanceIds.empty())
+  // Unlike instances, terrain covers the world uniformly -- a tile with no
+  // overlapping instances can still be entirely valid ground.
+  if (instanceIds.empty() && !terrainLattice_)
     return false;
 
   out.verts.clear();
@@ -192,5 +199,9 @@ bool ForgelightGeometrySource::queryTile(const float qmin[2],
       out.triangleObjects.push_back(static_cast<int>(instanceIndex));
     }
   }
-  return true;
+
+  if (terrainLattice_)
+    terrainLattice_->appendTile(qmin, qmax, out);
+
+  return !out.tris.empty();
 }

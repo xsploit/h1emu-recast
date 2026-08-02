@@ -11,6 +11,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <numeric>
 #include <set>
 #include <sstream>
@@ -35,6 +36,7 @@
 #include "Recast.h"
 #include "fastlz.h"
 #include "forgelight_geometry_source.h"
+#include "forgelight_heightmap_loader.h"
 #include "forgelight_nav_source.h"
 #include "geometry_source.h"
 #include "nav_semantic.h"
@@ -135,6 +137,8 @@ struct BuildOptions {
   std::string forgelightCollisionPath;
   std::string forgelightSemanticPath;
   bool forgelightStrictProduction = false;
+  std::string forgelightHeightmapPath;
+  float forgelightTerrainSpacing = 4.0f;
 };
 
 static const int NAVMESHSET_MAGIC = 'M' << 24 | 'S' << 16 | 'E' << 8 | 'T';
@@ -1936,6 +1940,10 @@ static void printUsage(const char *program) {
           "                              H1SEM1 file (geometry-source forgelight)\n"
           "  --forgelight-strict-production\n"
           "                              Reject unknown/terrain H1SEM1 semantics\n"
+          "  --forgelight-heightmap <path>\n"
+          "                              Optional heightmap image; enables terrain\n"
+          "  --forgelight-terrain-spacing <meters>\n"
+          "                              Fixed terrain lattice quad size (default 4)\n"
           "\n"
           "<input.obj> is ignored (but still required as a positional argument)\n"
           "when --geometry-source forgelight is used; geometry comes from\n"
@@ -2092,6 +2100,23 @@ static bool parseOptions(int argc, char *argv[], int start,
       options.forgelightStrictProduction = true;
       continue;
     }
+    if (strcmp(arg, "--forgelight-heightmap") == 0) {
+      if (++i >= argc) {
+        fprintf(stderr, "Missing value for --forgelight-heightmap\n");
+        return false;
+      }
+      options.forgelightHeightmapPath = argv[i];
+      continue;
+    }
+    if (strcmp(arg, "--forgelight-terrain-spacing") == 0) {
+      if (++i >= argc ||
+          !parseFloat(argv[i], options.forgelightTerrainSpacing) ||
+          options.forgelightTerrainSpacing <= 0.0f) {
+        fprintf(stderr, "Invalid value for --forgelight-terrain-spacing\n");
+        return false;
+      }
+      continue;
+    }
 
     float *target = nullptr;
     if (strcmp(arg, "--cell-size") == 0)
@@ -2190,7 +2215,8 @@ static bool parseOptions(int argc, char *argv[], int start,
       return false;
     }
   } else if (!options.forgelightCollisionPath.empty() ||
-            !options.forgelightSemanticPath.empty()) {
+            !options.forgelightSemanticPath.empty() ||
+            !options.forgelightHeightmapPath.empty()) {
     fprintf(stderr, "--forgelight-* options require "
                     "--geometry-source forgelight\n");
     return false;
@@ -2229,6 +2255,7 @@ int main(int argc, char *argv[]) {
   Mesh mesh;
   h1emu::nav::H1Col2Document forgelightCollision;
   h1emu::nav::H1Sem1Document forgelightSemantics;
+  std::optional<h1emu::nav::HeightmapRgb> forgelightHeightmap;
   std::unique_ptr<GeometrySource> source;
 
   if (options.geometrySource == GeometrySourceKind::Obj) {
@@ -2272,6 +2299,10 @@ int main(int argc, char *argv[]) {
       forgelightSemantics = h1emu::nav::loadH1Sem1(
           options.forgelightSemanticPath, forgelightCollision,
           options.forgelightStrictProduction);
+      if (!options.forgelightHeightmapPath.empty()) {
+        forgelightHeightmap.emplace(
+            h1emu::nav::loadHeightmapImage(options.forgelightHeightmapPath));
+      }
     } catch (const std::exception &error) {
       fprintf(stderr, "\nFailed to load ForgeLight source: %s\n",
               error.what());
@@ -2280,8 +2311,11 @@ int main(int argc, char *argv[]) {
     // Validated by parseOptions: forgelight requires --global-bounds.
     source = std::make_unique<ForgelightGeometrySource>(
         forgelightCollision, forgelightSemantics, options.globalBounds.bmin,
-        options.globalBounds.bmax);
-    printf(" done (%.2fs)\n", elapsed(tIdx));
+        options.globalBounds.bmax, 25.6f,
+        forgelightHeightmap ? &*forgelightHeightmap : nullptr,
+        options.forgelightTerrainSpacing);
+    printf(" done (%.2fs)%s\n", elapsed(tIdx),
+          forgelightHeightmap ? " (terrain enabled)" : "");
   }
   PrintContext ctx;
 
