@@ -16,8 +16,16 @@ file(GLOB DETOUR_TILECACHE_SOURCES ${RECAST_DIR}/DetourTileCache/Source/*.cpp)
 
 add_library(forgelight-nav-source STATIC
     forgelight_nav_source.cpp
+    forgelight_heightmap_loader.cpp
+    forgelight_instance_index.cpp
+    forgelight_geometry_source.cpp
 )
 target_include_directories(forgelight-nav-source PUBLIC ${CMAKE_SOURCE_DIR})
+# nav_semantic.h (shared with main.cpp) only needs Recast.h for the
+# RC_NULL_AREA constant -- header-only, no Recast .cpp sources need linking
+# into this library.
+target_include_directories(forgelight-nav-source PRIVATE
+    ${RECAST_DIR}/Recast/Include)
 
 add_executable(forgelight-nav-source-inspect
     forgelight_nav_source_inspect.cpp)
@@ -58,6 +66,7 @@ target_compile_definitions(navmesh-builder PRIVATE
 
 if(MSVC)
     target_compile_options(forgelight-nav-source PRIVATE /W4 /O2)
+    target_compile_definitions(forgelight-nav-source PRIVATE _CRT_SECURE_NO_WARNINGS)
     target_compile_options(forgelight-nav-source-inspect PRIVATE /W4 /O2)
     target_compile_options(navmesh-builder PRIVATE /W4 /O2 /fp:fast)
     target_compile_definitions(navmesh-builder PRIVATE _CRT_SECURE_NO_WARNINGS)
@@ -89,6 +98,21 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME forgelight-nav-source-contract
         COMMAND forgelight-nav-source-test)
+
+    add_executable(forgelight-geometry-source-test
+        tests/forgelight_geometry_source_test.cpp)
+    target_link_libraries(forgelight-geometry-source-test PRIVATE
+        forgelight-nav-source)
+    target_include_directories(forgelight-geometry-source-test PRIVATE
+        ${RECAST_DIR}/Recast/Include)
+    if(MSVC)
+        target_compile_options(forgelight-geometry-source-test PRIVATE /W4 /O2)
+    else()
+        target_compile_options(forgelight-geometry-source-test PRIVATE
+            -Wall -Wextra -Wpedantic)
+    endif()
+    add_test(NAME forgelight-geometry-source-contract
+        COMMAND forgelight-geometry-source-test)
 
     add_test(NAME tilecache-overlay-self-test
         COMMAND tilecache-overlay --self-test)
@@ -248,6 +272,14 @@ if(BUILD_TESTING)
             -DSOURCE_DIR=${CMAKE_SOURCE_DIR}
             -DOUTPUT_DIR=${CMAKE_BINARY_DIR}/tilecache-completeness
             -P ${CMAKE_SOURCE_DIR}/tests/verify_tilecache_completeness.cmake
+    )
+
+    add_test(NAME geometry-source-determinism
+        COMMAND ${CMAKE_COMMAND}
+            -DBUILDER=$<TARGET_FILE:navmesh-builder>
+            -DSOURCE_DIR=${CMAKE_SOURCE_DIR}
+            -DOUTPUT_DIR=${CMAKE_BINARY_DIR}/geometry-source-determinism
+            -P ${CMAKE_SOURCE_DIR}/tests/verify_geometry_source_determinism.cmake
     )
 endif()
 

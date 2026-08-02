@@ -71,6 +71,21 @@ Sha256Digest sha256(const std::vector<std::uint8_t> &bytes);
 std::string sha256Hex(const Sha256Digest &digest);
 std::vector<std::uint8_t> readFileBytes(const std::filesystem::path &path);
 
+// Stable per-instance zone IDs ("H1CID1-u32le-v1"), produced alongside
+// H1COL2/H1SEM1 by tools/forgelight/export_z1_instanced.py in the sibling
+// h1z1-pv-nav repo. Binding to a specific H1COL2 is external (matched by
+// instance count and directory/manifest provenance, not an embedded hash --
+// the on-disk format has no hash field, unlike H1SEM1).
+struct H1Cid1Document {
+  std::uint32_t version = 0;
+  std::vector<std::uint32_t> instanceStableIds;
+};
+
+H1Cid1Document parseH1Cid1(const std::vector<std::uint8_t> &bytes,
+                           std::size_t expectedCount);
+H1Cid1Document loadH1Cid1(const std::filesystem::path &path,
+                          std::size_t expectedCount);
+
 H1Col2Document parseH1Col2(const std::vector<std::uint8_t> &bytes);
 H1Col2Document loadH1Col2(const std::filesystem::path &path);
 

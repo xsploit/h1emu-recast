@@ -9,10 +9,13 @@
 #include <fstream>
 #include <iomanip>
 #include <map>
+#include <memory>
 #include <mutex>
+#include <numeric>
 #include <set>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #ifdef _WIN32
 #include <io.h>
@@ -31,7 +34,11 @@
 #include "DetourTileCacheBuilder.h"
 #include "Recast.h"
 #include "fastlz.h"
+#include "forgelight_geometry_source.h"
 #include "forgelight_nav_source.h"
+#include "geometry_source.h"
+#include "nav_semantic.h"
+#include "tile_raster_input.h"
 
 struct TriGrid {
   std::vector<std::vector<int>> cells;
@@ -99,106 +106,6 @@ static int TILE_SIZE = 64;
 
 static const char *SEMANTIC_CONTRACT = "h1emu-nav-semantics-v1";
 
-enum class NavSemantic : unsigned char {
-  Untagged,
-  OrdinaryMaterial,
-  Terrain,
-  Road,
-  FloorExterior,
-  FloorInterior,
-  Stair,
-  Ramp,
-  Threshold,
-  ObstacleStatic,
-  DoorPanelDynamic,
-  Exclude,
-  Unknown,
-  Invalid
-};
-
-enum NavArea : unsigned char {
-  NAV_AREA_TERRAIN = 1,
-  NAV_AREA_ROAD = 2,
-  NAV_AREA_FLOOR_EXTERIOR = 3,
-  NAV_AREA_FLOOR_INTERIOR = 4,
-  NAV_AREA_STAIR = 5,
-  NAV_AREA_RAMP = 6,
-  NAV_AREA_THRESHOLD = 7
-};
-
-enum NavFlag : unsigned short {
-  NAV_FLAG_WALK = 0x01,
-  NAV_FLAG_INDOOR = 0x02,
-  NAV_FLAG_TRANSITION = 0x04,
-  NAV_FLAG_DOOR = 0x08
-};
-
-struct SemanticSpec {
-  NavSemantic semantic;
-  const char *material;
-  unsigned char area;
-  unsigned short flags;
-  bool rasterizeNull;
-  bool exclude;
-};
-
-static const SemanticSpec SEMANTIC_SPECS[] = {
-    {NavSemantic::Terrain, "nav_terrain", NAV_AREA_TERRAIN, NAV_FLAG_WALK,
-     false, false},
-    {NavSemantic::Road, "nav_road", NAV_AREA_ROAD, NAV_FLAG_WALK, false,
-     false},
-    {NavSemantic::FloorExterior, "nav_floor_exterior",
-     NAV_AREA_FLOOR_EXTERIOR, NAV_FLAG_WALK, false, false},
-    {NavSemantic::FloorInterior, "nav_floor_interior",
-     NAV_AREA_FLOOR_INTERIOR, NAV_FLAG_WALK | NAV_FLAG_INDOOR, false, false},
-    {NavSemantic::Stair, "nav_stair", NAV_AREA_STAIR,
-     NAV_FLAG_WALK | NAV_FLAG_TRANSITION, false, false},
-    {NavSemantic::Ramp, "nav_ramp", NAV_AREA_RAMP,
-     NAV_FLAG_WALK | NAV_FLAG_TRANSITION, false, false},
-    {NavSemantic::Threshold, "nav_threshold", NAV_AREA_THRESHOLD,
-     NAV_FLAG_WALK | NAV_FLAG_TRANSITION | NAV_FLAG_DOOR, false, false},
-    {NavSemantic::ObstacleStatic, "nav_obstacle_static", RC_NULL_AREA, 0,
-     true, false},
-    {NavSemantic::DoorPanelDynamic, "nav_door_panel_dynamic", RC_NULL_AREA, 0,
-     false, true},
-    {NavSemantic::Exclude, "nav_exclude", RC_NULL_AREA, 0, false, true},
-    {NavSemantic::Unknown, "nav_unknown", RC_NULL_AREA, 0, true, false},
-};
-
-static const SemanticSpec *semanticSpec(NavSemantic semantic) {
-  for (const SemanticSpec &spec : SEMANTIC_SPECS)
-    if (spec.semantic == semantic)
-      return &spec;
-  return nullptr;
-}
-
-static NavSemantic parseSemanticMaterial(const std::string &material) {
-  for (const SemanticSpec &spec : SEMANTIC_SPECS)
-    if (material == spec.material)
-      return spec.semantic;
-  if (material.rfind("nav_", 0) == 0)
-    return NavSemantic::Invalid;
-  return NavSemantic::OrdinaryMaterial;
-}
-
-static unsigned short flagsForArea(unsigned char area) {
-  switch (area) {
-  case NAV_AREA_TERRAIN:
-  case NAV_AREA_ROAD:
-  case NAV_AREA_FLOOR_EXTERIOR:
-    return NAV_FLAG_WALK;
-  case NAV_AREA_FLOOR_INTERIOR:
-    return NAV_FLAG_WALK | NAV_FLAG_INDOOR;
-  case NAV_AREA_STAIR:
-  case NAV_AREA_RAMP:
-    return NAV_FLAG_WALK | NAV_FLAG_TRANSITION;
-  case NAV_AREA_THRESHOLD:
-    return NAV_FLAG_WALK | NAV_FLAG_TRANSITION | NAV_FLAG_DOOR;
-  default:
-    return 0;
-  }
-}
-
 struct BuildBounds {
   bool enabled = false;
   float minX = 0.0f;
@@ -213,6 +120,8 @@ struct GlobalBounds {
   float bmax[3] = {};
 };
 
+enum class GeometrySourceKind { Obj, Forgelight };
+
 struct BuildOptions {
   BuildBounds bounds;
   GlobalBounds globalBounds;
@@ -222,6 +131,10 @@ struct BuildOptions {
   bool verifyBakedSemantics = false;
   bool requireAllSemantics = false;
   std::string semanticReportPath;
+  GeometrySourceKind geometrySource = GeometrySourceKind::Obj;
+  std::string forgelightCollisionPath;
+  std::string forgelightSemanticPath;
+  bool forgelightStrictProduction = false;
 };
 
 static const int NAVMESHSET_MAGIC = 'M' << 24 | 'S' << 16 | 'E' << 8 | 'T';
@@ -390,11 +303,6 @@ static unsigned int ilog2(unsigned int v) {
   r |= s;
   return r | (v >> 1);
 }
-
-struct NonWalkableVolume {
-  float bmin[3];
-  float bmax[3];
-};
 
 struct Mesh {
   std::vector<float> verts; // x,y,z triples
@@ -1004,6 +912,81 @@ static bool writeSemanticReport(const char *inputPath, const std::string &path,
   return true;
 }
 
+// Wraps the OBJ Mesh+TriGrid path behind the GeometrySource interface without
+// changing OBJ behavior. Holds a non-owning reference to a Mesh the caller
+// keeps alive (main() still needs the original Mesh afterward for
+// OBJ-specific reporting, so this does not take ownership or reload).
+//
+// queryTile() performs the same TriGrid::query() lookup buildTile/
+// buildTileCacheLayers already did directly before this seam existed, then
+// remaps the selected triangles into a compact per-tile local vertex space.
+// That remap is genuinely new work relative to today's direct global-index
+// access: a GeometrySource must hand back a self-contained batch so that a
+// future non-OBJ source -- which has no single whole-world vertex buffer to
+// share with a caller-owned TriGrid -- can implement the same interface.
+class ObjGeometrySource : public GeometrySource {
+public:
+  explicit ObjGeometrySource(const Mesh &mesh) : mesh_(mesh) {
+    grid_.build(mesh_.verts.data(), mesh_.tris.data(),
+                (int)(mesh_.tris.size() / 3), mesh_.bmin, mesh_.bmax,
+                (float)TILE_SIZE * CELL_SIZE);
+  }
+
+  void worldBounds(float bmin[3], float bmax[3]) const override {
+    rcVcopy(bmin, mesh_.bmin);
+    rcVcopy(bmax, mesh_.bmax);
+  }
+
+  bool semanticInput() const override { return mesh_.semanticInput; }
+
+  bool queryTile(const float qmin[2], const float qmax[2],
+                TileRasterInput &out) const override {
+    const std::vector<int> triIds = grid_.query(qmin, qmax);
+    if (triIds.empty())
+      return false;
+
+    out.verts.clear();
+    out.tris.clear();
+    out.nonWalkableTris.clear();
+    out.triangleSemantics.clear();
+    out.triangleObjects.clear();
+    out.nonWalkableVolumes = mesh_.nonWalkableVolumes;
+    out.semanticInput = mesh_.semanticInput;
+
+    out.tris.reserve(triIds.size() * 3);
+    out.nonWalkableTris.reserve(triIds.size());
+    out.triangleSemantics.reserve(triIds.size());
+    out.triangleObjects.reserve(triIds.size());
+
+    // Local vertex remap: the same source vertex referenced by two selected
+    // triangles must resolve to the same local index, so a plain running
+    // counter is not enough -- track first-seen global->local assignments.
+    std::unordered_map<int, int> remap;
+    remap.reserve(triIds.size() * 2);
+    for (int triId : triIds) {
+      for (int k = 0; k < 3; ++k) {
+        const int globalVert = mesh_.tris[triId * 3 + k];
+        const auto [it, inserted] =
+            remap.try_emplace(globalVert, (int)(out.verts.size() / 3));
+        if (inserted) {
+          out.verts.push_back(mesh_.verts[globalVert * 3 + 0]);
+          out.verts.push_back(mesh_.verts[globalVert * 3 + 1]);
+          out.verts.push_back(mesh_.verts[globalVert * 3 + 2]);
+        }
+        out.tris.push_back(it->second);
+      }
+      out.nonWalkableTris.push_back(mesh_.nonWalkableTris[triId]);
+      out.triangleSemantics.push_back(mesh_.triangleSemantics[triId]);
+      out.triangleObjects.push_back(mesh_.triangleObjects[triId]);
+    }
+    return true;
+  }
+
+private:
+  const Mesh &mesh_;
+  TriGrid grid_;
+};
+
 static bool validateSemanticContract(const Mesh &mesh, bool requireAll) {
   if (mesh.tris.size() / 3 != mesh.triangleSemantics.size() ||
       mesh.triangleSemantics.size() != mesh.nonWalkableTris.size()) {
@@ -1043,7 +1026,8 @@ struct RasterTriangles {
 // This is the single semantic-to-Recast mapping used by both the direct
 // navmesh and TileCache builders. Keeping slope marking and semantic overrides
 // here prevents the two output paths from assigning different areas.
-static RasterTriangles prepareRasterTriangles(rcContext *ctx, const Mesh &mesh,
+static RasterTriangles prepareRasterTriangles(rcContext *ctx,
+                                               const TileRasterInput &mesh,
                                                const std::vector<int> &triIds,
                                                float walkableSlopeAngle) {
   RasterTriangles raster;
@@ -1126,7 +1110,7 @@ static bool trianglePlaneHeightXZ(const float *a, const float *b,
   return true;
 }
 
-static void markTriangleSpans(const Mesh &mesh, int triId,
+static void markTriangleSpans(const TileRasterInput &mesh, int triId,
                               const rcConfig &cfg,
                               rcCompactHeightfield &chf,
                               std::vector<unsigned char> *protectedSpans,
@@ -1201,7 +1185,7 @@ static void markTriangleSpans(const Mesh &mesh, int triId,
   }
 }
 
-static void applyNonWalkableCarves(rcContext *ctx, const Mesh &mesh,
+static void applyNonWalkableCarves(rcContext *ctx, const TileRasterInput &mesh,
                                    const std::vector<int> &triIds,
                                    const rcConfig &cfg,
                                    rcCompactHeightfield &chf) {
@@ -1257,7 +1241,7 @@ static void debugCompactAreas(const char *stage,
   printf("\n");
 }
 
-static bool validateSemanticRasterMapping(const Mesh &mesh) {
+static bool validateSemanticRasterMapping(const TileRasterInput &mesh) {
   std::vector<int> triIds(mesh.triangleSemantics.size());
   for (size_t i = 0; i < triIds.size(); ++i)
     triIds[i] = (int)i;
@@ -1301,10 +1285,9 @@ static bool validateSemanticRasterMapping(const Mesh &mesh) {
   return true;
 }
 
-static unsigned char *buildTile(rcContext *ctx, const Mesh &mesh,
-                                const TriGrid &grid, const float *tileMin,
-                                const float *tileMax, int tileX, int tileY,
-                                int &outDataSize) {
+static unsigned char *buildTile(rcContext *ctx, const GeometrySource &source,
+                                const float *tileMin, const float *tileMax,
+                                int tileX, int tileY, int &outDataSize) {
   rcConfig cfg{};
   cfg.cs = CELL_SIZE;
   cfg.ch = CELL_HEIGHT;
@@ -1319,7 +1302,7 @@ static unsigned char *buildTile(rcContext *ctx, const Mesh &mesh,
   // stair treads after they survived voxelization. Legacy geometry still uses
   // the configured noise filter; strict semantic input keeps every classified
   // region and relies on the classifier to reject decoration.
-  cfg.minRegionArea = mesh.semanticInput ? 0 : (int)rcSqr(REGION_MIN_SIZE);
+  cfg.minRegionArea = source.semanticInput() ? 0 : (int)rcSqr(REGION_MIN_SIZE);
   cfg.mergeRegionArea = (int)rcSqr(REGION_MERGE_SIZE);
   cfg.maxVertsPerPoly = VERTS_PER_POLY;
   cfg.tileSize = TILE_SIZE;
@@ -1344,21 +1327,26 @@ static unsigned char *buildTile(rcContext *ctx, const Mesh &mesh,
     return nullptr;
   }
 
-  // Query only triangles overlapping this tile
+  // Query only geometry overlapping this tile. TileRasterInput is already
+  // filtered to this tile's expanded bounds, so the selection list below is
+  // simply every triangle it contains (identity), unlike the pre-seam direct
+  // grid.query() which selected a subset of a shared, unfiltered global mesh.
   float qmin[2] = {cfg.bmin[0], cfg.bmin[2]};
   float qmax[2] = {cfg.bmax[0], cfg.bmax[2]};
-  const std::vector<int> triIds = grid.query(qmin, qmax);
-  if (triIds.empty()) {
+  TileRasterInput tileInput;
+  if (!source.queryTile(qmin, qmax, tileInput)) {
     rcFreeHeightField(hf);
     return nullptr;
   }
+  std::vector<int> triIds(tileInput.tris.size() / 3);
+  std::iota(triIds.begin(), triIds.end(), 0);
 
-  const float *verts = mesh.verts.data();
-  const int nVerts = (int)(mesh.verts.size() / 3);
+  const float *verts = tileInput.verts.data();
+  const int nVerts = (int)(tileInput.verts.size() / 3);
 
   const int nTris = (int)triIds.size();
   const RasterTriangles raster =
-      prepareRasterTriangles(ctx, mesh, triIds, cfg.walkableSlopeAngle);
+      prepareRasterTriangles(ctx, tileInput, triIds, cfg.walkableSlopeAngle);
   rcRasterizeTriangles(ctx, verts, nVerts, raster.indices.data(),
                        raster.areas.data(), nTris, *hf, cfg.walkableClimb);
 
@@ -1369,7 +1357,7 @@ static unsigned char *buildTile(rcContext *ctx, const Mesh &mesh,
   // semantic input already identifies stairs, ramps, and thresholds, so keep
   // its null spans authoritative and let ordinary climb connectivity handle
   // those tagged traversal surfaces.
-  if (!mesh.semanticInput)
+  if (!tileInput.semanticInput)
     rcFilterLowHangingWalkableObstacles(ctx, cfg.walkableClimb, *hf);
   rcFilterLedgeSpans(ctx, cfg.walkableHeight, cfg.walkableClimb, *hf);
   rcFilterWalkableLowHeightSpans(ctx, cfg.walkableHeight, *hf);
@@ -1384,7 +1372,7 @@ static unsigned char *buildTile(rcContext *ctx, const Mesh &mesh,
   rcFreeHeightField(hf);
 
   debugCompactAreas("direct-before-carves", *chf);
-  applyNonWalkableCarves(ctx, mesh, triIds, cfg, *chf);
+  applyNonWalkableCarves(ctx, tileInput, triIds, cfg, *chf);
   debugCompactAreas("direct-after-carves", *chf);
 
   if (!rcErodeWalkableArea(ctx, cfg.walkableRadius, *chf)) {
@@ -1486,7 +1474,7 @@ static unsigned char *buildTile(rcContext *ctx, const Mesh &mesh,
 }
 
 static std::vector<std::pair<unsigned char *, int>>
-buildTileCacheLayers(rcContext *ctx, const Mesh &mesh, const TriGrid &grid,
+buildTileCacheLayers(rcContext *ctx, const GeometrySource &source,
                      const float *tileMin, const float *tileMax, int tileX,
                      int tileY) {
   std::vector<std::pair<unsigned char *, int>> result;
@@ -1501,7 +1489,7 @@ buildTileCacheLayers(rcContext *ctx, const Mesh &mesh, const TriGrid &grid,
   cfg.maxEdgeLen = (int)(EDGE_MAX_LEN / cfg.cs);
   cfg.maxSimplificationError = EDGE_MAX_ERROR;
   // Keep the direct and TileCache builders on the same semantic-region policy.
-  cfg.minRegionArea = mesh.semanticInput ? 0 : (int)rcSqr(REGION_MIN_SIZE);
+  cfg.minRegionArea = source.semanticInput() ? 0 : (int)rcSqr(REGION_MIN_SIZE);
   cfg.mergeRegionArea = (int)rcSqr(REGION_MERGE_SIZE);
   cfg.maxVertsPerPoly = VERTS_PER_POLY;
   cfg.tileSize = TILE_SIZE;
@@ -1528,25 +1516,27 @@ buildTileCacheLayers(rcContext *ctx, const Mesh &mesh, const TriGrid &grid,
 
   float qmin[2] = {cfg.bmin[0], cfg.bmin[2]};
   float qmax[2] = {cfg.bmax[0], cfg.bmax[2]};
-  const std::vector<int> triIds = grid.query(qmin, qmax);
-  if (triIds.empty()) {
+  TileRasterInput tileInput;
+  if (!source.queryTile(qmin, qmax, tileInput)) {
     rcFreeHeightField(hf);
     return result;
   }
+  std::vector<int> triIds(tileInput.tris.size() / 3);
+  std::iota(triIds.begin(), triIds.end(), 0);
 
-  const float *verts = mesh.verts.data();
-  const int nVerts = (int)(mesh.verts.size() / 3);
+  const float *verts = tileInput.verts.data();
+  const int nVerts = (int)(tileInput.verts.size() / 3);
 
   const int nTris = (int)triIds.size();
   const RasterTriangles raster =
-      prepareRasterTriangles(ctx, mesh, triIds, cfg.walkableSlopeAngle);
+      prepareRasterTriangles(ctx, tileInput, triIds, cfg.walkableSlopeAngle);
   rcRasterizeTriangles(ctx, verts, nVerts, raster.indices.data(),
                        raster.areas.data(), nTris, *hf, cfg.walkableClimb);
 
   // Match the direct builder: semantic null spans are authoritative. Applying
   // the legacy low-obstacle promotion here would also make direct and
   // TileCache collision behavior diverge after materialization.
-  if (!mesh.semanticInput)
+  if (!tileInput.semanticInput)
     rcFilterLowHangingWalkableObstacles(ctx, cfg.walkableClimb, *hf);
   rcFilterLedgeSpans(ctx, cfg.walkableHeight, cfg.walkableClimb, *hf);
   rcFilterWalkableLowHeightSpans(ctx, cfg.walkableHeight, *hf);
@@ -1561,7 +1551,7 @@ buildTileCacheLayers(rcContext *ctx, const Mesh &mesh, const TriGrid &grid,
   rcFreeHeightField(hf);
 
   debugCompactAreas("tilecache-before-carves", *chf);
-  applyNonWalkableCarves(ctx, mesh, triIds, cfg, *chf);
+  applyNonWalkableCarves(ctx, tileInput, triIds, cfg, *chf);
   debugCompactAreas("tilecache-after-carves", *chf);
 
   if (!rcErodeWalkableArea(ctx, cfg.walkableRadius, *chf)) {
@@ -1938,6 +1928,20 @@ static void printUsage(const char *program) {
           "  --validate-semantics-only Parse/report semantics without baking\n"
           "  --verify-baked-semantics  Inspect direct and TileCache polygons\n"
           "  --require-all-semantics    Require every canonical tag (fixtures)\n"
+          "  --geometry-source obj|forgelight\n"
+          "                              Select the tile geometry source (default obj)\n"
+          "  --forgelight-collision <path>\n"
+          "                              H1COL2 file (geometry-source forgelight)\n"
+          "  --forgelight-semantics <path>\n"
+          "                              H1SEM1 file (geometry-source forgelight)\n"
+          "  --forgelight-strict-production\n"
+          "                              Reject unknown/terrain H1SEM1 semantics\n"
+          "\n"
+          "<input.obj> is ignored (but still required as a positional argument)\n"
+          "when --geometry-source forgelight is used; geometry comes from\n"
+          "--forgelight-collision/--forgelight-semantics instead, and\n"
+          "--global-bounds becomes required. --validate-semantics-only and\n"
+          "--verify-baked-semantics remain OBJ-only.\n"
           "\n"
           "The human profile uses cs=.2, ch=.1, radius=.2, climb=1.3,\n"
           "slope=45, tile=128, region-min=8, and region-merge=20.\n",
@@ -2053,6 +2057,41 @@ static bool parseOptions(int argc, char *argv[], int start,
       options.semanticReportPath = argv[i];
       continue;
     }
+    if (strcmp(arg, "--geometry-source") == 0) {
+      if (++i >= argc) {
+        fprintf(stderr, "Missing value for --geometry-source\n");
+        return false;
+      }
+      if (strcmp(argv[i], "obj") == 0) {
+        options.geometrySource = GeometrySourceKind::Obj;
+      } else if (strcmp(argv[i], "forgelight") == 0) {
+        options.geometrySource = GeometrySourceKind::Forgelight;
+      } else {
+        fprintf(stderr, "Unknown --geometry-source value: %s\n", argv[i]);
+        return false;
+      }
+      continue;
+    }
+    if (strcmp(arg, "--forgelight-collision") == 0) {
+      if (++i >= argc) {
+        fprintf(stderr, "Missing value for --forgelight-collision\n");
+        return false;
+      }
+      options.forgelightCollisionPath = argv[i];
+      continue;
+    }
+    if (strcmp(arg, "--forgelight-semantics") == 0) {
+      if (++i >= argc) {
+        fprintf(stderr, "Missing value for --forgelight-semantics\n");
+        return false;
+      }
+      options.forgelightSemanticPath = argv[i];
+      continue;
+    }
+    if (strcmp(arg, "--forgelight-strict-production") == 0) {
+      options.forgelightStrictProduction = true;
+      continue;
+    }
 
     float *target = nullptr;
     if (strcmp(arg, "--cell-size") == 0)
@@ -2124,6 +2163,38 @@ static bool parseOptions(int argc, char *argv[], int start,
     fprintf(stderr, "Build bounds must be contained by --global-bounds\n");
     return false;
   }
+  if (options.geometrySource == GeometrySourceKind::Forgelight) {
+    if (options.forgelightCollisionPath.empty() ||
+        options.forgelightSemanticPath.empty()) {
+      fprintf(stderr, "--geometry-source forgelight requires both "
+                      "--forgelight-collision and --forgelight-semantics\n");
+      return false;
+    }
+    if (!options.globalBounds.enabled) {
+      fprintf(stderr,
+              "--geometry-source forgelight requires --global-bounds\n");
+      return false;
+    }
+    // These OBJ-only diagnostic paths depend on whole-Mesh bookkeeping
+    // (semantic histograms, source-triangle counters, legacy-object flags)
+    // that the ForgeLight source never populates -- reject explicitly
+    // rather than silently produce an empty/misleading report.
+    if (options.validateSemanticsOnly) {
+      fprintf(stderr, "--validate-semantics-only is OBJ-only; not supported "
+                      "with --geometry-source forgelight\n");
+      return false;
+    }
+    if (options.verifyBakedSemantics) {
+      fprintf(stderr, "--verify-baked-semantics is OBJ-only; not supported "
+                      "with --geometry-source forgelight\n");
+      return false;
+    }
+  } else if (!options.forgelightCollisionPath.empty() ||
+            !options.forgelightSemanticPath.empty()) {
+    fprintf(stderr, "--forgelight-* options require "
+                    "--geometry-source forgelight\n");
+    return false;
+  }
   return true;
 }
 
@@ -2156,26 +2227,63 @@ int main(int argc, char *argv[]) {
   if (!clearSemanticReportPublication(options.semanticReportPath))
     return 1;
   Mesh mesh;
-  if (!loadObj(inputPath, mesh, options.legacyObjectFallback,
-               options.dynamicDoorObstacles) ||
-      !validateSemanticContract(mesh, options.requireAllSemantics))
-    return 1;
-  if (options.validateSemanticsOnly) {
-    if (!validateSemanticRasterMapping(mesh) ||
-        !writeSemanticReport(inputPath, options.semanticReportPath, mesh,
-                             false))
-      return 1;
-    return 0;
-  }
+  h1emu::nav::H1Col2Document forgelightCollision;
+  h1emu::nav::H1Sem1Document forgelightSemantics;
+  std::unique_ptr<GeometrySource> source;
 
-  printf("Building spatial index...");
-  fflush(stdout);
-  TimePoint tIdx = Clock::now();
+  if (options.geometrySource == GeometrySourceKind::Obj) {
+    if (!loadObj(inputPath, mesh, options.legacyObjectFallback,
+                options.dynamicDoorObstacles) ||
+        !validateSemanticContract(mesh, options.requireAllSemantics))
+      return 1;
+
+    // Only used by the --validate-semantics-only whole-mesh diagnostic path
+    // below, which never queries a GeometrySource -- it inspects every
+    // source triangle at once, before any tiling occurs.
+    TileRasterInput meshInput;
+    meshInput.verts = mesh.verts;
+    meshInput.tris = mesh.tris;
+    meshInput.nonWalkableTris = mesh.nonWalkableTris;
+    meshInput.triangleSemantics = mesh.triangleSemantics;
+    meshInput.triangleObjects = mesh.triangleObjects;
+    meshInput.nonWalkableVolumes = mesh.nonWalkableVolumes;
+    meshInput.semanticInput = mesh.semanticInput;
+
+    if (options.validateSemanticsOnly) {
+      if (!validateSemanticRasterMapping(meshInput) ||
+          !writeSemanticReport(inputPath, options.semanticReportPath, mesh,
+                              false))
+        return 1;
+      return 0;
+    }
+
+    printf("Building spatial index...");
+    fflush(stdout);
+    TimePoint tIdx = Clock::now();
+    source = std::make_unique<ObjGeometrySource>(mesh);
+    printf(" done (%.2fs)\n", elapsed(tIdx));
+  } else {
+    printf("Loading ForgeLight source...");
+    fflush(stdout);
+    TimePoint tIdx = Clock::now();
+    try {
+      forgelightCollision =
+          h1emu::nav::loadH1Col2(options.forgelightCollisionPath);
+      forgelightSemantics = h1emu::nav::loadH1Sem1(
+          options.forgelightSemanticPath, forgelightCollision,
+          options.forgelightStrictProduction);
+    } catch (const std::exception &error) {
+      fprintf(stderr, "\nFailed to load ForgeLight source: %s\n",
+              error.what());
+      return 1;
+    }
+    // Validated by parseOptions: forgelight requires --global-bounds.
+    source = std::make_unique<ForgelightGeometrySource>(
+        forgelightCollision, forgelightSemantics, options.globalBounds.bmin,
+        options.globalBounds.bmax);
+    printf(" done (%.2fs)\n", elapsed(tIdx));
+  }
   PrintContext ctx;
-  TriGrid grid;
-  grid.build(mesh.verts.data(), mesh.tris.data(), (int)(mesh.tris.size() / 3),
-             mesh.bmin, mesh.bmax, (float)TILE_SIZE * CELL_SIZE);
-  printf(" done (%.2fs)\n", elapsed(tIdx));
 
   float worldBmin[3];
   float worldBmax[3];
@@ -2183,8 +2291,7 @@ int main(int argc, char *argv[]) {
     rcVcopy(worldBmin, options.globalBounds.bmin);
     rcVcopy(worldBmax, options.globalBounds.bmax);
   } else {
-    rcVcopy(worldBmin, mesh.bmin);
-    rcVcopy(worldBmax, mesh.bmax);
+    source->worldBounds(worldBmin, worldBmax);
   }
 
   int gw = 0, gh = 0;
@@ -2358,11 +2465,11 @@ int main(int argc, char *argv[]) {
     PrintContext tileCtx(tx, ty);
     int dataSize = 0;
     unsigned char *data =
-        buildTile(&tileCtx, mesh, grid, tmin, tmax, tx, ty, dataSize);
+        buildTile(&tileCtx, *source, tmin, tmax, tx, ty, dataSize);
 
     PrintContext cacheCtx(tx, ty);
     auto cacheLayers =
-        buildTileCacheLayers(&cacheCtx, mesh, grid, tmin, tmax, tx, ty);
+        buildTileCacheLayers(&cacheCtx, *source, tmin, tmax, tx, ty);
     std::vector<PendingTileCacheLayer> &pending =
         pendingCacheLayers[(size_t)i];
     pending.reserve(cacheLayers.size());
@@ -2815,11 +2922,21 @@ int main(int argc, char *argv[]) {
         {"tilecache",
          outDir / ("z1_cache_" + std::to_string(p) + ".bin")});
   }
-  if (!writeSemanticReport(inputPath, options.semanticReportPath, mesh,
-                           bakedSemanticsVerified, reportArtifacts)) {
-    dtFreeNavMesh(navMesh);
-    dtFreeTileCache(tileCache);
-    return 1;
+  // writeSemanticReport reads whole-Mesh bookkeeping (histograms,
+  // source-triangle counters, legacy-object flags) that the ForgeLight
+  // source never populates; producing it from an empty Mesh there would be
+  // a misleading, not merely absent, provenance report. ForgeLight-source
+  // provenance reporting is a distinct follow-on, not part of this seam.
+  if (options.geometrySource == GeometrySourceKind::Obj) {
+    if (!writeSemanticReport(inputPath, options.semanticReportPath, mesh,
+                             bakedSemanticsVerified, reportArtifacts)) {
+      dtFreeNavMesh(navMesh);
+      dtFreeTileCache(tileCache);
+      return 1;
+    }
+  } else {
+    printf("Skipping semantic provenance report: not yet implemented for "
+           "--geometry-source forgelight\n");
   }
   printf("Total time: %s\n", fmtDuration(elapsed(tTotal)).c_str());
 

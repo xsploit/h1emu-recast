@@ -1,7 +1,13 @@
 #include "forgelight_nav_source.h"
 
+#include "forgelight_heightmap_loader.h"
+#include "forgelight_instance_index.h"
+
+#include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <stdexcept>
@@ -87,6 +93,32 @@ std::vector<std::uint8_t> semanticFixture(const Sha256Digest &digest,
   bytes.push_back(first);
   bytes.push_back(second);
   return bytes;
+}
+
+std::vector<std::uint8_t>
+h1cid1Fixture(const std::vector<std::uint32_t> &ids) {
+  std::vector<std::uint8_t> bytes{'H', '1', 'C', 'I', 'D', '1', 0, 0};
+  appendU32(bytes, 1);
+  appendU32(bytes, static_cast<std::uint32_t>(ids.size()));
+  for (std::uint32_t id : ids)
+    appendU32(bytes, id);
+  return bytes;
+}
+
+CollisionInstance makeInstance(float minX, float minZ, float maxX,
+                               float maxZ) {
+  CollisionInstance instance;
+  instance.meshIndex = 0;
+  instance.transform = {0, 0, 0,    0, 0,    0,    1,   1,
+                        1, 1, minX, 0, minZ, maxX, 1,   maxZ};
+  return instance;
+}
+
+bool containsExactly(std::vector<std::uint32_t> actual,
+                     std::vector<std::uint32_t> expected) {
+  std::sort(actual.begin(), actual.end());
+  std::sort(expected.begin(), expected.end());
+  return actual == expected;
 }
 
 void expectFailure(const std::string &name,
@@ -249,6 +281,124 @@ int main() {
             "heightmap world-axis mapping mismatch");
     require(heightmap.sampleNearestWorld(99999.0f, -99999.0f) == 0.0f,
             "heightmap edge clamp mismatch");
+
+    const auto cid1Bytes = h1cid1Fixture({1001, 1002, 1003});
+    const H1Cid1Document cid1 = parseH1Cid1(cid1Bytes, 3);
+    require(cid1.version == 1 && cid1.instanceStableIds.size() == 3 &&
+                cid1.instanceStableIds[0] == 1001 &&
+                cid1.instanceStableIds[2] == 1003,
+            "H1CID1 decode mismatch");
+
+    expectFailure("H1CID1 count mismatch",
+                  [&] { parseH1Cid1(cid1Bytes, 4); });
+    auto badMagic = cid1Bytes;
+    badMagic[0] = 'x';
+    expectFailure("H1CID1 bad magic", [&] { parseH1Cid1(badMagic, 3); });
+    auto badVersion = cid1Bytes;
+    setU32(badVersion, 8, 2);
+    expectFailure("H1CID1 bad version", [&] { parseH1Cid1(badVersion, 3); });
+    auto truncatedCid1 = cid1Bytes;
+    truncatedCid1.pop_back();
+    expectFailure("truncated H1CID1",
+                  [&] { parseH1Cid1(truncatedCid1, 3); });
+    auto trailingCid1 = cid1Bytes;
+    trailingCid1.push_back(0);
+    expectFailure("trailing H1CID1", [&] { parseH1Cid1(trailingCid1, 3); });
+    const auto duplicateCid1Bytes = h1cid1Fixture({7, 7});
+    expectFailure("duplicate H1CID1 zone ID",
+                  [&] { parseH1Cid1(duplicateCid1Bytes, 2); });
+    const H1Cid1Document emptyCid1 = parseH1Cid1(h1cid1Fixture({}), 0);
+    require(emptyCid1.instanceStableIds.empty(),
+            "empty H1CID1 should decode to zero instances");
+
+    // 2x2 truecolor PNG, RGB pixels (16,0,0) (17,0,0) / (18,16,0) (19,31,0),
+    // matching the raw HeightmapRgb fixture above exactly so both loaders
+    // are checked against the same expected decoded heights.
+    const std::vector<std::uint8_t> heightmapPng{
+        137, 80,  78,  71,  13,  10,  26,  10,  0,   0,   0,  13,
+        73,  72,  68,  82,  0,   0,   0,   2,   0,   0,   0,  2,
+        8,   2,   0,   0,   0,   253, 212, 154, 115, 0,   0,  0,
+        22,  73,  68,  65,  84,  120, 156, 99,  20,  96,  96, 96,
+        100, 96,  96,  97,  18,  96,  96,  228, 103, 0,   0,  1,
+        143, 0,   57,  55,  128, 163, 10,  0,   0,   0,   0,  73,
+        69,  78,  68,  174, 66,  96,  130};
+    const std::filesystem::path tempPng =
+        std::filesystem::temp_directory_path() /
+        "forgelight_nav_source_test_heightmap.png";
+    {
+      std::ofstream out(tempPng, std::ios::binary);
+      out.write(reinterpret_cast<const char *>(heightmapPng.data()),
+                static_cast<std::streamsize>(heightmapPng.size()));
+    }
+    const HeightmapRgb decodedHeightmap = loadHeightmapImage(tempPng);
+    std::filesystem::remove(tempPng);
+    require(decodedHeightmap.width() == 2 && decodedHeightmap.height() == 2,
+            "decoded heightmap PNG dimensions mismatch");
+    require(decodedHeightmap.decodePixel(0, 0) == 0.0f,
+            "decoded heightmap PNG origin decode mismatch");
+    require(decodedHeightmap.decodePixel(0, 1) == 16.5f,
+            "decoded heightmap PNG green-channel decode mismatch");
+    require(std::fabs(decodedHeightmap.sampleNearestWorld(4095.0f, -4095.0f) -
+                      24.96875f) < 0.00001f,
+            "decoded heightmap PNG world-axis mapping mismatch");
+
+    // Synthetic 40x40 world, 10-unit cells (4x4 grid), five instances:
+    // A=0 in cell (0,0); B=1 and C=2 both touch cell (1,1), C spans four
+    // cells; D=3 lies fully outside world bounds and must clamp to the
+    // last cell rather than being dropped; E=4 lies fully below the world
+    // origin and must clamp to cell (0,0).
+    H1Col2Document synthetic;
+    synthetic.meshes.resize(1);
+    synthetic.instances = {
+        makeInstance(1, 1, 2, 2),       // A: cell (0,0)
+        makeInstance(12, 12, 13, 13),   // B: cell (1,1)
+        makeInstance(18, 18, 22, 22),   // C: cells (1,1),(2,1),(1,2),(2,2)
+        makeInstance(100, 100, 110, 110), // D: clamps to cell (3,3)
+        makeInstance(-20, -20, -10, -10), // E: clamps to cell (0,0)
+    };
+    InstanceIndex index;
+    const float synthBmin[2] = {0.0f, 0.0f};
+    const float synthBmax[2] = {40.0f, 40.0f};
+    index.build(synthetic, synthBmin, synthBmax, 10.0f);
+    require(index.cellCountX() == 4 && index.cellCountZ() == 4,
+            "InstanceIndex grid dimensions mismatch");
+
+    {
+      const float qmin[2] = {0.0f, 0.0f};
+      const float qmax[2] = {9.0f, 9.0f};
+      require(containsExactly(index.query(qmin, qmax), {0, 4}),
+              "InstanceIndex cell (0,0) query mismatch");
+    }
+    {
+      const float qmin[2] = {10.0f, 10.0f};
+      const float qmax[2] = {19.0f, 19.0f};
+      require(containsExactly(index.query(qmin, qmax), {1, 2}),
+              "InstanceIndex cell (1,1) query mismatch");
+    }
+    {
+      const float qmin[2] = {20.0f, 20.0f};
+      const float qmax[2] = {25.0f, 25.0f};
+      require(containsExactly(index.query(qmin, qmax), {2}),
+              "InstanceIndex cell (2,2) query mismatch");
+    }
+    {
+      const float qmin[2] = {35.0f, 35.0f};
+      const float qmax[2] = {39.0f, 39.0f};
+      require(containsExactly(index.query(qmin, qmax), {3}),
+              "InstanceIndex out-of-bounds instance should clamp to last cell");
+    }
+    {
+      const float qmin[2] = {30.0f, 0.0f};
+      const float qmax[2] = {39.0f, 9.0f};
+      require(containsExactly(index.query(qmin, qmax), {}),
+              "InstanceIndex empty cell should return no instances");
+    }
+    {
+      const float qmin[2] = {0.0f, 0.0f};
+      const float qmax[2] = {40.0f, 40.0f};
+      require(containsExactly(index.query(qmin, qmax), {0, 1, 2, 3, 4}),
+              "InstanceIndex full-range query should return every instance");
+    }
 
     std::cout << "forgelight nav source contract tests passed\n";
     return 0;

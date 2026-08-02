@@ -8,6 +8,7 @@
 #include <limits>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_set>
 
 namespace h1emu::nav {
 namespace {
@@ -16,10 +17,13 @@ constexpr std::array<std::uint8_t, 8> H1COL2_MAGIC{
     'H', '1', 'C', 'O', 'L', '2', 0, 0};
 constexpr std::array<std::uint8_t, 8> H1SEM1_MAGIC{
     'H', '1', 'S', 'E', 'M', '1', 0, 0};
+constexpr std::array<std::uint8_t, 8> H1CID1_MAGIC{
+    'H', '1', 'C', 'I', 'D', '1', 0, 0};
 constexpr std::uint32_t H1COL2_VERSION = 2;
 constexpr std::uint32_t H1SEM1_VERSION = 1;
 constexpr std::uint32_t H1SEM1_HEADER_BYTES = 64;
 constexpr std::uint32_t H1SEM1_SCHEMA_VERSION = 1;
+constexpr std::uint32_t H1CID1_VERSION = 1;
 constexpr std::uint32_t MAX_MESHES = 1'000'000;
 constexpr std::uint32_t MAX_INSTANCES = 10'000'000;
 
@@ -472,6 +476,49 @@ void validateH1Sem1Compatibility(const H1Col2Document &collision,
             std::to_string(triangleIndex - start));
     }
   }
+}
+
+H1Cid1Document parseH1Cid1(const std::vector<std::uint8_t> &bytes,
+                           std::size_t expectedCount) {
+  Reader reader(bytes);
+  requireMagic(reader.bytes<8>("H1CID1 magic"), H1CID1_MAGIC, "H1CID1");
+
+  H1Cid1Document output;
+  output.version = reader.u32("H1CID1 version");
+  if (output.version != H1CID1_VERSION)
+    throw std::runtime_error("unsupported H1CID1 version " +
+                             std::to_string(output.version));
+  const std::uint32_t count = reader.u32("H1CID1 count");
+  if (count > MAX_INSTANCES)
+    throw std::runtime_error("H1CID1 count exceeds safety limit");
+  if (static_cast<std::size_t>(count) != expectedCount)
+    throw std::runtime_error("H1CID1 count mismatch: expected " +
+                             std::to_string(expectedCount) + ", got " +
+                             std::to_string(count));
+
+  reader.require(checkedProduct(count, 4, "H1CID1 instance IDs"),
+                 "H1CID1 instance IDs");
+  output.instanceStableIds.reserve(count);
+  std::unordered_set<std::uint32_t> seen;
+  seen.reserve(count);
+  for (std::uint32_t index = 0; index < count; ++index) {
+    const std::uint32_t id = reader.u32("H1CID1 instance ID");
+    if (!seen.insert(id).second)
+      throw std::runtime_error("H1CID1 contains duplicate zone ID at index " +
+                               std::to_string(index));
+    output.instanceStableIds.push_back(id);
+  }
+  // Exact length, matching decode_h1cid1's fail-closed truncated/trailing
+  // checks in tools/forgelight/export_z1_instanced.py (h1z1-pv-nav repo).
+  if (reader.remaining() != 0)
+    throw std::runtime_error("trailing H1CID1 data at byte " +
+                             std::to_string(reader.offset()));
+  return output;
+}
+
+H1Cid1Document loadH1Cid1(const std::filesystem::path &path,
+                          std::size_t expectedCount) {
+  return parseH1Cid1(readFileBytes(path), expectedCount);
 }
 
 HeightmapRgb::HeightmapRgb(std::uint32_t width, std::uint32_t height,
