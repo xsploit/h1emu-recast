@@ -20,6 +20,7 @@ add_library(forgelight-nav-source STATIC
     forgelight_instance_index.cpp
     forgelight_terrain_lattice.cpp
     forgelight_geometry_source.cpp
+    navigation_transitions.cpp
 )
 target_include_directories(forgelight-nav-source PUBLIC ${CMAKE_SOURCE_DIR})
 # nav_semantic.h (shared with main.cpp) only needs Recast.h for the
@@ -114,6 +115,19 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME forgelight-geometry-source-contract
         COMMAND forgelight-geometry-source-test)
+
+    add_executable(navigation-transitions-test
+        tests/navigation_transitions_test.cpp)
+    target_link_libraries(navigation-transitions-test PRIVATE
+        forgelight-nav-source)
+    if(MSVC)
+        target_compile_options(navigation-transitions-test PRIVATE /W4 /O2)
+    else()
+        target_compile_options(navigation-transitions-test PRIVATE
+            -Wall -Wextra -Wpedantic)
+    endif()
+    add_test(NAME navigation-transitions-contract
+        COMMAND navigation-transitions-test)
 
     add_test(NAME tilecache-overlay-self-test
         COMMAND tilecache-overlay --self-test)

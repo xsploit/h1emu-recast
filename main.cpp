@@ -40,6 +40,7 @@
 #include "forgelight_nav_source.h"
 #include "geometry_source.h"
 #include "nav_semantic.h"
+#include "navigation_transitions.h"
 #include "tile_raster_input.h"
 
 struct TriGrid {
@@ -139,6 +140,7 @@ struct BuildOptions {
   bool forgelightStrictProduction = false;
   std::string forgelightHeightmapPath;
   float forgelightTerrainSpacing = 4.0f;
+  std::string forgelightTransitionsPath;
 };
 
 static const int NAVMESHSET_MAGIC = 'M' << 24 | 'S' << 16 | 'E' << 8 | 'T';
@@ -192,12 +194,46 @@ struct FastLZCompressor : dtTileCacheCompressor {
   }
 };
 
-struct NullMeshProcess : dtTileCacheMeshProcess {
+static void bindNavigationTransitions(
+    dtNavMeshCreateParams &params,
+    const h1emu::nav::NavigationTransitionBinding &binding) {
+  params.offMeshConVerts =
+      binding.vertices.empty() ? nullptr : binding.vertices.data();
+  params.offMeshConRad =
+      binding.radii.empty() ? nullptr : binding.radii.data();
+  params.offMeshConDir =
+      binding.directions.empty() ? nullptr : binding.directions.data();
+  params.offMeshConAreas =
+      binding.areas.empty() ? nullptr : binding.areas.data();
+  params.offMeshConFlags =
+      binding.flags.empty() ? nullptr : binding.flags.data();
+  params.offMeshConUserID =
+      binding.userIds.empty() ? nullptr : binding.userIds.data();
+  params.offMeshConCount = (int)binding.size();
+}
+
+struct NavigationMeshProcess : dtTileCacheMeshProcess {
+  explicit NavigationMeshProcess(
+      const std::vector<h1emu::nav::NavigationTransition> *transitions)
+      : transitions(transitions) {}
+
   void process(dtNavMeshCreateParams *params, unsigned char *polyAreas,
                unsigned short *polyFlags) override {
     for (int i = 0; i < params->polyCount; ++i)
       polyFlags[i] = flagsForArea(polyAreas[i]);
+
+    if (!transitions || transitions->empty())
+      return;
+    // A compressed TileCache layer does not contain authored graph edges.
+    // Rebind the links whose start belongs to this materialized tile/layer;
+    // dtCreateNavMeshData immediately consumes these member-backed arrays.
+    binding = h1emu::nav::buildNavigationTransitionBinding(
+        *transitions, params->bmin, params->bmax, params->walkableClimb);
+    bindNavigationTransitions(*params, binding);
   }
+
+  const std::vector<h1emu::nav::NavigationTransition> *transitions;
+  h1emu::nav::NavigationTransitionBinding binding;
 };
 
 using Clock = std::chrono::steady_clock;
@@ -1291,7 +1327,9 @@ static bool validateSemanticRasterMapping(const TileRasterInput &mesh) {
 
 static unsigned char *buildTile(rcContext *ctx, const GeometrySource &source,
                                 const float *tileMin, const float *tileMax,
-                                int tileX, int tileY, int &outDataSize) {
+                                int tileX, int tileY, int &outDataSize,
+                                const std::vector<h1emu::nav::NavigationTransition>
+                                    &transitions) {
   rcConfig cfg{};
   cfg.cs = CELL_SIZE;
   cfg.ch = CELL_HEIGHT;
@@ -1461,6 +1499,15 @@ static unsigned char *buildTile(rcContext *ctx, const GeometrySource &source,
   params.cs = cfg.cs;
   params.ch = cfg.ch;
   params.buildBvTree = true;
+
+  // Direct navmesh tile blobs carry off-mesh connections natively. Passing
+  // the canonical list is thread-safe (immutable input, worker-local binding).
+  // Preselect by the nominal tile's half-open start-point ownership; Detour
+  // then performs its tighter polygon-height/connectivity classification.
+  const h1emu::nav::NavigationTransitionBinding transitionBinding =
+      h1emu::nav::buildNavigationTransitionBinding(transitions, tileMin,
+                                                   tileMax);
+  bindNavigationTransitions(params, transitionBinding);
 
   unsigned char *navData = nullptr;
   int navDataSize = 0;
@@ -1944,6 +1991,8 @@ static void printUsage(const char *program) {
           "                              Optional heightmap image; enables terrain\n"
           "  --forgelight-terrain-spacing <meters>\n"
           "                              Fixed terrain lattice quad size (default 4)\n"
+          "  --forgelight-transitions <path>\n"
+          "                              Authored world-space bidirectional links JSON\n"
           "\n"
           "<input.obj> is ignored (but still required as a positional argument)\n"
           "when --geometry-source forgelight is used; geometry comes from\n"
@@ -2117,6 +2166,14 @@ static bool parseOptions(int argc, char *argv[], int start,
       }
       continue;
     }
+    if (strcmp(arg, "--forgelight-transitions") == 0) {
+      if (++i >= argc) {
+        fprintf(stderr, "Missing value for --forgelight-transitions\n");
+        return false;
+      }
+      options.forgelightTransitionsPath = argv[i];
+      continue;
+    }
 
     float *target = nullptr;
     if (strcmp(arg, "--cell-size") == 0)
@@ -2216,7 +2273,8 @@ static bool parseOptions(int argc, char *argv[], int start,
     }
   } else if (!options.forgelightCollisionPath.empty() ||
             !options.forgelightSemanticPath.empty() ||
-            !options.forgelightHeightmapPath.empty()) {
+            !options.forgelightHeightmapPath.empty() ||
+            !options.forgelightTransitionsPath.empty()) {
     fprintf(stderr, "--forgelight-* options require "
                     "--geometry-source forgelight\n");
     return false;
@@ -2256,6 +2314,7 @@ int main(int argc, char *argv[]) {
   h1emu::nav::H1Col2Document forgelightCollision;
   h1emu::nav::H1Sem1Document forgelightSemantics;
   std::optional<h1emu::nav::HeightmapRgb> forgelightHeightmap;
+  std::vector<h1emu::nav::NavigationTransition> navigationTransitions;
   std::unique_ptr<GeometrySource> source;
 
   if (options.geometrySource == GeometrySourceKind::Obj) {
@@ -2303,6 +2362,10 @@ int main(int argc, char *argv[]) {
         forgelightHeightmap.emplace(
             h1emu::nav::loadHeightmapImage(options.forgelightHeightmapPath));
       }
+      if (!options.forgelightTransitionsPath.empty()) {
+        navigationTransitions = h1emu::nav::loadNavigationTransitions(
+            options.forgelightTransitionsPath);
+      }
     } catch (const std::exception &error) {
       fprintf(stderr, "\nFailed to load ForgeLight source: %s\n",
               error.what());
@@ -2314,8 +2377,11 @@ int main(int argc, char *argv[]) {
         options.globalBounds.bmax, 25.6f,
         forgelightHeightmap ? &*forgelightHeightmap : nullptr,
         options.forgelightTerrainSpacing);
-    printf(" done (%.2fs)%s\n", elapsed(tIdx),
+    printf(" done (%.2fs)%s", elapsed(tIdx),
           forgelightHeightmap ? " (terrain enabled)" : "");
+    if (!navigationTransitions.empty())
+      printf(" (%zu authored transition(s))", navigationTransitions.size());
+    printf("\n");
   }
   PrintContext ctx;
 
@@ -2419,7 +2485,7 @@ int main(int argc, char *argv[]) {
   tcParams.maxObstacles = 20000;
 
   FastLZCompressor tcComp;
-  NullMeshProcess tcMeshProc;
+  NavigationMeshProcess tcMeshProc(&navigationTransitions);
   dtTileCacheAlloc tcAlloc;
   dtTileCache *tileCache = dtAllocTileCache();
   if (dtStatusFailed(
@@ -2510,7 +2576,8 @@ int main(int argc, char *argv[]) {
     PrintContext tileCtx(tx, ty);
     int dataSize = 0;
     unsigned char *data =
-        buildTile(&tileCtx, *source, tmin, tmax, tx, ty, dataSize);
+        buildTile(&tileCtx, *source, tmin, tmax, tx, ty, dataSize,
+                  navigationTransitions);
 
     PrintContext cacheCtx(tx, ty);
     auto cacheLayers =

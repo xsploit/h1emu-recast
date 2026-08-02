@@ -44,6 +44,33 @@ regional bake in the full cache's exact origin, tile-coordinate system, and
 capacity even though `--bounds` limits the work. The global extent and every
 profile/voxel/agent setting must match the destination cache exactly.
 
+### Authored ForgeLight transitions
+
+ForgeLight builds can consume the server's canonical world-space transition
+sidecar directly:
+
+```sh
+./build/navmesh-builder placeholder.obj ./out/z1.bin \
+  --geometry-source forgelight \
+  --forgelight-collision ./z1_collision.bin \
+  --forgelight-semantics ./z1_collision.semantics.bin \
+  --forgelight-transitions ./navigationTransitions.json \
+  --global-bounds -4096 -100 -4096 4096 500 4096
+```
+
+Each transition requires a unique `name`, three-number `start` and `end`
+arrays, an optional positive `radius` (default `0.8`), and optional
+`bidirectional` (default `true`; false is rejected by schema v1). `kind` and
+`source` strings are accepted as provenance-only metadata. Links use the
+`nav_threshold` area/flags and are owned by the half-open tile containing the
+start endpoint.
+
+Direct `z1_*.bin` tiles embed the Detour off-mesh connection. Compressed
+`z1_cache_*.bin` layers intentionally do not: the live TileCache mesh-process
+must receive the same manifested `navigationTransitions.json` whenever it
+materializes or rebuilds a layer. This keeps cache bytes independent of the
+authored graph sidecar while preserving links across runtime rebuilds.
+
 ## Deterministic regional TileCache overlays
 
 `tilecache-overlay` replaces complete `(tx,ty)` columns in a full cache. It
