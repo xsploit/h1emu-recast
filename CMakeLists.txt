@@ -14,6 +14,16 @@ file(GLOB RECAST_SOURCES ${RECAST_DIR}/Recast/Source/*.cpp)
 file(GLOB DETOUR_SOURCES ${RECAST_DIR}/Detour/Source/*.cpp)
 file(GLOB DETOUR_TILECACHE_SOURCES ${RECAST_DIR}/DetourTileCache/Source/*.cpp)
 
+add_library(forgelight-nav-source STATIC
+    forgelight_nav_source.cpp
+)
+target_include_directories(forgelight-nav-source PUBLIC ${CMAKE_SOURCE_DIR})
+
+add_executable(forgelight-nav-source-inspect
+    forgelight_nav_source_inspect.cpp)
+target_link_libraries(forgelight-nav-source-inspect PRIVATE
+    forgelight-nav-source)
+
 add_executable(navmesh-builder
     main.cpp
     ${RECAST_SOURCES}
@@ -21,6 +31,8 @@ add_executable(navmesh-builder
     ${DETOUR_TILECACHE_SOURCES}
     ${RECAST_DIR}/RecastDemo/Contrib/fastlz/fastlz.c
 )
+
+target_link_libraries(navmesh-builder PRIVATE forgelight-nav-source)
 
 target_include_directories(navmesh-builder PRIVATE
     ${RECAST_DIR}/Recast/Include
@@ -45,11 +57,17 @@ target_compile_definitions(navmesh-builder PRIVATE
 )
 
 if(MSVC)
+    target_compile_options(forgelight-nav-source PRIVATE /W4 /O2)
+    target_compile_options(forgelight-nav-source-inspect PRIVATE /W4 /O2)
     target_compile_options(navmesh-builder PRIVATE /W4 /O2 /fp:fast)
     target_compile_definitions(navmesh-builder PRIVATE _CRT_SECURE_NO_WARNINGS)
     target_compile_options(tilecache-overlay PRIVATE /W4 /O2)
     target_compile_definitions(tilecache-overlay PRIVATE _CRT_SECURE_NO_WARNINGS)
 else()
+    target_compile_options(forgelight-nav-source PRIVATE
+        -Wall -Wextra -Wpedantic)
+    target_compile_options(forgelight-nav-source-inspect PRIVATE
+        -Wall -Wextra -Wpedantic)
     target_compile_options(navmesh-builder PRIVATE
         -Wall -Wextra
         -march=native
@@ -59,6 +77,19 @@ else()
 endif()
 
 if(BUILD_TESTING)
+    add_executable(forgelight-nav-source-test
+        tests/forgelight_nav_source_test.cpp)
+    target_link_libraries(forgelight-nav-source-test PRIVATE
+        forgelight-nav-source)
+    if(MSVC)
+        target_compile_options(forgelight-nav-source-test PRIVATE /W4 /O2)
+    else()
+        target_compile_options(forgelight-nav-source-test PRIVATE
+            -Wall -Wextra -Wpedantic)
+    endif()
+    add_test(NAME forgelight-nav-source-contract
+        COMMAND forgelight-nav-source-test)
+
     add_test(NAME tilecache-overlay-self-test
         COMMAND tilecache-overlay --self-test)
 
