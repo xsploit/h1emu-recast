@@ -128,6 +128,30 @@ if(BUILD_TESTING)
             -P ${CMAKE_SOURCE_DIR}/tests/verify_bounded_semantic_coverage.cmake
     )
 
+    add_test(NAME semantic-slanted-obstacle-locality
+        COMMAND navmesh-builder
+            ${CMAKE_SOURCE_DIR}/tests/semantic_slanted_obstacle.obj
+            ${CMAKE_BINARY_DIR}/semantic-slanted-obstacle/output.bin
+            --profile human
+            --agent-climb 0.5
+            --region-min 1
+            --region-merge 1
+            --dynamic-door-obstacles
+            --verify-baked-semantics
+            --semantic-report ${CMAKE_BINARY_DIR}/semantic-slanted-obstacle/semantics.json
+    )
+
+    add_test(NAME semantic-small-threshold-retained
+        COMMAND navmesh-builder
+            ${CMAKE_SOURCE_DIR}/tests/semantic_small_threshold.obj
+            ${CMAKE_BINARY_DIR}/semantic-small-threshold/output.bin
+            --profile human
+            --agent-radius 0
+            --dynamic-door-obstacles
+            --verify-baked-semantics
+            --semantic-report ${CMAKE_BINARY_DIR}/semantic-small-threshold/semantics.json
+    )
+
     add_test(NAME semantic-report-path-independent
         COMMAND ${CMAKE_COMMAND}
             -DBUILDER=$<TARGET_FILE:navmesh-builder>

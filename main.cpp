@@ -392,6 +392,10 @@ struct Mesh {
   // Parallel to tris (one entry per triangle). Semantic OBJ input assigns one
   // canonical nav_* material to every source face before triangulation.
   std::vector<NavSemantic> triangleSemantics;
+  // Parallel to tris. Component-level semantic rules can override the default
+  // material of the enclosing OBJ object without allowing an unrelated prop
+  // object to lose collision at an overlapping position.
+  std::vector<int> triangleObjects;
   std::vector<NonWalkableVolume> nonWalkableVolumes;
   std::map<std::string, long long> semanticHistogram;
   std::set<std::string> invalidSemanticMaterials;
@@ -433,6 +437,7 @@ static bool loadObj(const char *path, Mesh &out, bool legacyObjectFallback,
   std::string objectName;
   std::string materialName;
   NavSemantic currentSemantic = NavSemantic::Untagged;
+  int currentObjectId = -1;
   float objectMin[3] = {1e30f, 1e30f, 1e30f};
   float objectMax[3] = {-1e30f, -1e30f, -1e30f};
   size_t objectTriStart = 0;
@@ -489,6 +494,7 @@ static bool loadObj(const char *path, Mesh &out, bool legacyObjectFallback,
       out.tris.resize(objectTriStart);
       out.nonWalkableTris.resize(objectTriStart / 3);
       out.triangleSemantics.resize(objectTriStart / 3);
+      out.triangleObjects.resize(objectTriStart / 3);
       excludedHospitalDecorationObjects++;
       excludedHospitalDecorationTriangles += (long long)removed;
     } else if (applyLegacyObjectPolicy && staticVehicleObstacle) {
@@ -519,6 +525,7 @@ static bool loadObj(const char *path, Mesh &out, bool legacyObjectFallback,
   while (fgets(line, sizeof(line), f)) {
     if (line[0] == 'o' && line[1] == ' ') {
       finishObject();
+      ++currentObjectId;
       char *name = line + 2;
       name[strcspn(name, "\r\n")] = '\0';
       objectName = name;
@@ -597,6 +604,7 @@ static bool loadObj(const char *path, Mesh &out, bool legacyObjectFallback,
         out.tris.push_back(idx[i]);
         out.nonWalkableTris.push_back(0);
         out.triangleSemantics.push_back(currentSemantic);
+        out.triangleObjects.push_back(currentObjectId);
       }
     }
   }
@@ -851,6 +859,132 @@ static RasterTriangles prepareRasterTriangles(rcContext *ctx, const Mesh &mesh,
   return raster;
 }
 
+static bool triangleOverlapsCellXZ(const float *a, const float *b,
+                                   const float *c, float minX, float minZ,
+                                   float maxX, float maxZ) {
+  const float *vertices[3] = {a, b, c};
+  const auto separatedOnAxis = [&](float axisX, float axisZ) {
+    if (fabsf(axisX) + fabsf(axisZ) <= 1e-8f)
+      return false;
+    float triMin = 1e30f;
+    float triMax = -1e30f;
+    for (const float *vertex : vertices) {
+      const float projection = vertex[0] * axisX + vertex[2] * axisZ;
+      triMin = std::min(triMin, projection);
+      triMax = std::max(triMax, projection);
+    }
+    const float boxCenterX = (minX + maxX) * 0.5f;
+    const float boxCenterZ = (minZ + maxZ) * 0.5f;
+    const float boxCenter = boxCenterX * axisX + boxCenterZ * axisZ;
+    const float boxRadius =
+        (maxX - minX) * 0.5f * fabsf(axisX) +
+        (maxZ - minZ) * 0.5f * fabsf(axisZ);
+    return triMax < boxCenter - boxRadius || triMin > boxCenter + boxRadius;
+  };
+  if (separatedOnAxis(1.0f, 0.0f) || separatedOnAxis(0.0f, 1.0f))
+    return false;
+  for (int edge = 0; edge < 3; ++edge) {
+    const float *from = vertices[edge];
+    const float *to = vertices[(edge + 1) % 3];
+    if (separatedOnAxis(-(to[2] - from[2]), to[0] - from[0]))
+      return false;
+  }
+  return true;
+}
+
+static bool trianglePlaneHeightXZ(const float *a, const float *b,
+                                  const float *c, float x, float z,
+                                  float &height) {
+  const float denominator =
+      (b[2] - c[2]) * (a[0] - c[0]) +
+      (c[0] - b[0]) * (a[2] - c[2]);
+  if (fabsf(denominator) <= 1e-8f)
+    return false;
+  const float wa = ((b[2] - c[2]) * (x - c[0]) +
+                    (c[0] - b[0]) * (z - c[2])) /
+                   denominator;
+  const float wb = ((c[2] - a[2]) * (x - c[0]) +
+                    (a[0] - c[0]) * (z - c[2])) /
+                   denominator;
+  height = wa * a[1] + wb * b[1] + (1.0f - wa - wb) * c[1];
+  return true;
+}
+
+static void markTriangleSpans(const Mesh &mesh, int triId,
+                              const rcConfig &cfg,
+                              rcCompactHeightfield &chf,
+                              std::vector<unsigned char> *protectedSpans,
+                              bool collectProtection) {
+  const float *a = &mesh.verts[mesh.tris[triId * 3 + 0] * 3];
+  const float *b = &mesh.verts[mesh.tris[triId * 3 + 1] * 3];
+  const float *c = &mesh.verts[mesh.tris[triId * 3 + 2] * 3];
+  const float minX = std::min({a[0], b[0], c[0]});
+  const float maxX = std::max({a[0], b[0], c[0]});
+  const float minZ = std::min({a[2], b[2], c[2]});
+  const float maxZ = std::max({a[2], b[2], c[2]});
+  int firstX = (int)floorf((minX - chf.bmin[0]) / chf.cs);
+  int lastX = (int)floorf((maxX - chf.bmin[0]) / chf.cs);
+  int firstZ = (int)floorf((minZ - chf.bmin[2]) / chf.cs);
+  int lastZ = (int)floorf((maxZ - chf.bmin[2]) / chf.cs);
+  if (lastX < 0 || lastZ < 0 || firstX >= chf.width ||
+      firstZ >= chf.height)
+    return;
+  firstX = std::max(0, firstX);
+  lastX = std::min(chf.width - 1, lastX);
+  firstZ = std::max(0, firstZ);
+  lastZ = std::min(chf.height - 1, lastZ);
+
+  const float quantizationTolerance =
+      std::max(cfg.ch * 2.0f, cfg.ch * DETAIL_SAMPLE_MAX_ERR);
+  for (int z = firstZ; z <= lastZ; ++z) {
+    for (int x = firstX; x <= lastX; ++x) {
+      const float sampleX = chf.bmin[0] + ((float)x + 0.5f) * chf.cs;
+      const float sampleZ = chf.bmin[2] + ((float)z + 0.5f) * chf.cs;
+      const float cellMinX = chf.bmin[0] + (float)x * chf.cs;
+      const float cellMinZ = chf.bmin[2] + (float)z * chf.cs;
+      if (!triangleOverlapsCellXZ(a, b, c, cellMinX, cellMinZ,
+                                  cellMinX + chf.cs, cellMinZ + chf.cs))
+        continue;
+      float surfaceY = 0.0f;
+      const bool hasPlaneHeight =
+          trianglePlaneHeightXZ(a, b, c, sampleX, sampleZ, surfaceY);
+      const float triangleMinY = std::min({a[1], b[1], c[1]});
+      const float triangleMaxY = std::max({a[1], b[1], c[1]});
+      const rcCompactCell &cell = chf.cells[x + z * chf.width];
+      const int lastSpan = (int)(cell.index + cell.count);
+      for (int spanIndex = (int)cell.index; spanIndex < lastSpan;
+           ++spanIndex) {
+        if (chf.areas[spanIndex] == RC_NULL_AREA)
+          continue;
+        const float spanY = chf.bmin[1] + chf.spans[spanIndex].y * chf.ch;
+        const float clearance =
+            hasPlaneHeight
+                ? surfaceY - spanY
+                : (triangleMinY >= spanY ? triangleMinY - spanY
+                                         : (triangleMaxY >= spanY ? 0.0f
+                                                                  : -1e30f));
+        if (collectProtection) {
+          if (fabsf(clearance) <= quantizationTolerance)
+            (*protectedSpans)[spanIndex] = 1;
+          continue;
+        }
+        // Preserve a more-specific walkable component on the same object when
+        // the object's coarse obstacle surface is coplanar or underneath it.
+        // An overhead surface still enforces normal headroom.
+        if (protectedSpans && (*protectedSpans)[spanIndex] &&
+            clearance <= quantizationTolerance)
+          continue;
+        // Only invalidate the same layer or a walkable span beneath this
+        // obstacle without sufficient standing clearance. Distinct floors
+        // above it are valid multi-storey topology.
+        if (clearance >= -quantizationTolerance &&
+            clearance <= AGENT_HEIGHT)
+          chf.areas[spanIndex] = RC_NULL_AREA;
+      }
+    }
+  }
+}
+
 static void applyNonWalkableCarves(rcContext *ctx, const Mesh &mesh,
                                    const std::vector<int> &triIds,
                                    const rcConfig &cfg,
@@ -862,37 +996,49 @@ static void applyNonWalkableCarves(rcContext *ctx, const Mesh &mesh,
     rcMarkBoxArea(ctx, volume.bmin, volume.bmax, RC_NULL_AREA, chf);
   }
 
-  // rcFilterLowHangingWalkableObstacles can promote a shallow null span back
-  // to the walkable area beneath it. Re-apply semantic obstacle bounds after
-  // compact-heightfield filtering so roofs, bottoms, and walls remain carved.
-  // Bounds are per source triangle, avoiding object-wide boxes that would erase
-  // legitimate floors inside mixed-semantics structure meshes.
+  struct ObjectSemanticTriangles {
+    std::vector<int> walkable;
+    std::vector<int> obstacles;
+  };
+  std::map<int, ObjectSemanticTriangles> objects;
   for (int triId : triIds) {
     const SemanticSpec *spec = semanticSpec(mesh.triangleSemantics[triId]);
-    if (!spec || !spec->rasterizeNull)
+    if (!spec)
       continue;
-    float bmin[3] = {1e30f, 1e30f, 1e30f};
-    float bmax[3] = {-1e30f, -1e30f, -1e30f};
-    for (int corner = 0; corner < 3; ++corner) {
-      const float *vertex =
-          &mesh.verts[mesh.tris[triId * 3 + corner] * 3];
-      for (int axis = 0; axis < 3; ++axis) {
-        bmin[axis] = std::min(bmin[axis], vertex[axis]);
-        bmax[axis] = std::max(bmax[axis], vertex[axis]);
-      }
-    }
-    const float horizontalPad = cfg.cs * 0.5f;
-    bmin[0] -= horizontalPad;
-    bmin[2] -= horizontalPad;
-    bmax[0] += horizontalPad;
-    bmax[2] += horizontalPad;
-    bmin[1] -= cfg.ch * 2.0f;
-    bmax[1] += cfg.ch * 2.0f;
-    if (bmax[0] < cfg.bmin[0] || bmin[0] > cfg.bmax[0] ||
-        bmax[2] < cfg.bmin[2] || bmin[2] > cfg.bmax[2])
-      continue;
-    rcMarkBoxArea(ctx, bmin, bmax, RC_NULL_AREA, chf);
+    ObjectSemanticTriangles &object = objects[mesh.triangleObjects[triId]];
+    if (spec->rasterizeNull)
+      object.obstacles.push_back(triId);
+    else if (spec->area != RC_NULL_AREA)
+      object.walkable.push_back(triId);
   }
+  for (const auto &[objectId, triangles] : objects) {
+    (void)objectId;
+    if (triangles.obstacles.empty())
+      continue;
+    std::vector<unsigned char> protectedSpans;
+    std::vector<unsigned char> *protection = nullptr;
+    if (!triangles.walkable.empty()) {
+      protectedSpans.assign(chf.spanCount, 0);
+      protection = &protectedSpans;
+      for (int triId : triangles.walkable)
+        markTriangleSpans(mesh, triId, cfg, chf, protection, true);
+    }
+    for (int triId : triangles.obstacles)
+      markTriangleSpans(mesh, triId, cfg, chf, protection, false);
+  }
+}
+
+static void debugCompactAreas(const char *stage,
+                              const rcCompactHeightfield &chf) {
+  if (!getenv("H1EMU_NAV_DEBUG_SEMANTIC_STAGES"))
+    return;
+  std::map<unsigned int, int> histogram;
+  for (int i = 0; i < chf.spanCount; ++i)
+    histogram[chf.areas[i]]++;
+  printf("[SEMANTIC-STAGE] %s", stage);
+  for (const auto &[area, count] : histogram)
+    printf(" area%u=%d", area, count);
+  printf("\n");
 }
 
 static bool validateSemanticRasterMapping(const Mesh &mesh) {
@@ -952,7 +1098,12 @@ static unsigned char *buildTile(rcContext *ctx, const Mesh &mesh,
   cfg.walkableRadius = (int)ceilf(AGENT_RADIUS / cfg.cs);
   cfg.maxEdgeLen = (int)(EDGE_MAX_LEN / cfg.cs);
   cfg.maxSimplificationError = EDGE_MAX_ERROR;
-  cfg.minRegionArea = (int)rcSqr(REGION_MIN_SIZE);
+  // Canonical semantic components are intentional authored topology. Global
+  // small-region pruning can otherwise delete short thresholds and individual
+  // stair treads after they survived voxelization. Legacy geometry still uses
+  // the configured noise filter; strict semantic input keeps every classified
+  // region and relies on the classifier to reject decoration.
+  cfg.minRegionArea = mesh.semanticInput ? 0 : (int)rcSqr(REGION_MIN_SIZE);
   cfg.mergeRegionArea = (int)rcSqr(REGION_MERGE_SIZE);
   cfg.maxVertsPerPoly = VERTS_PER_POLY;
   cfg.tileSize = TILE_SIZE;
@@ -995,7 +1146,15 @@ static unsigned char *buildTile(rcContext *ctx, const Mesh &mesh,
   rcRasterizeTriangles(ctx, verts, nVerts, raster.indices.data(),
                        raster.areas.data(), nTris, *hf, cfg.walkableClimb);
 
-  rcFilterLowHangingWalkableObstacles(ctx, cfg.walkableClimb, *hf);
+  // The low-hanging filter deliberately copies a neighboring walkable area
+  // onto a shallow RC_NULL_AREA span. That heuristic is useful for legacy,
+  // unclassified collision, but it violates the semantic contract by turning
+  // an explicitly tagged obstacle back into a traversable surface. Strict
+  // semantic input already identifies stairs, ramps, and thresholds, so keep
+  // its null spans authoritative and let ordinary climb connectivity handle
+  // those tagged traversal surfaces.
+  if (!mesh.semanticInput)
+    rcFilterLowHangingWalkableObstacles(ctx, cfg.walkableClimb, *hf);
   rcFilterLedgeSpans(ctx, cfg.walkableHeight, cfg.walkableClimb, *hf);
   rcFilterWalkableLowHeightSpans(ctx, cfg.walkableHeight, *hf);
 
@@ -1008,12 +1167,15 @@ static unsigned char *buildTile(rcContext *ctx, const Mesh &mesh,
   }
   rcFreeHeightField(hf);
 
+  debugCompactAreas("direct-before-carves", *chf);
   applyNonWalkableCarves(ctx, mesh, triIds, cfg, *chf);
+  debugCompactAreas("direct-after-carves", *chf);
 
   if (!rcErodeWalkableArea(ctx, cfg.walkableRadius, *chf)) {
     rcFreeCompactHeightfield(chf);
     return nullptr;
   }
+  debugCompactAreas("direct-after-erosion", *chf);
 
   // Layer partitioning is designed for tiled, multi-storey worlds and cannot
   // produce the overlapping regions that make watershed fail in dense POIs.
@@ -1122,7 +1284,8 @@ buildTileCacheLayers(rcContext *ctx, const Mesh &mesh, const TriGrid &grid,
   cfg.walkableRadius = (int)ceilf(AGENT_RADIUS / cfg.cs);
   cfg.maxEdgeLen = (int)(EDGE_MAX_LEN / cfg.cs);
   cfg.maxSimplificationError = EDGE_MAX_ERROR;
-  cfg.minRegionArea = (int)rcSqr(REGION_MIN_SIZE);
+  // Keep the direct and TileCache builders on the same semantic-region policy.
+  cfg.minRegionArea = mesh.semanticInput ? 0 : (int)rcSqr(REGION_MIN_SIZE);
   cfg.mergeRegionArea = (int)rcSqr(REGION_MERGE_SIZE);
   cfg.maxVertsPerPoly = VERTS_PER_POLY;
   cfg.tileSize = TILE_SIZE;
@@ -1164,7 +1327,11 @@ buildTileCacheLayers(rcContext *ctx, const Mesh &mesh, const TriGrid &grid,
   rcRasterizeTriangles(ctx, verts, nVerts, raster.indices.data(),
                        raster.areas.data(), nTris, *hf, cfg.walkableClimb);
 
-  rcFilterLowHangingWalkableObstacles(ctx, cfg.walkableClimb, *hf);
+  // Match the direct builder: semantic null spans are authoritative. Applying
+  // the legacy low-obstacle promotion here would also make direct and
+  // TileCache collision behavior diverge after materialization.
+  if (!mesh.semanticInput)
+    rcFilterLowHangingWalkableObstacles(ctx, cfg.walkableClimb, *hf);
   rcFilterLedgeSpans(ctx, cfg.walkableHeight, cfg.walkableClimb, *hf);
   rcFilterWalkableLowHeightSpans(ctx, cfg.walkableHeight, *hf);
 
@@ -1177,12 +1344,15 @@ buildTileCacheLayers(rcContext *ctx, const Mesh &mesh, const TriGrid &grid,
   }
   rcFreeHeightField(hf);
 
+  debugCompactAreas("tilecache-before-carves", *chf);
   applyNonWalkableCarves(ctx, mesh, triIds, cfg, *chf);
+  debugCompactAreas("tilecache-after-carves", *chf);
 
   if (!rcErodeWalkableArea(ctx, cfg.walkableRadius, *chf)) {
     rcFreeCompactHeightfield(chf);
     return result;
   }
+  debugCompactAreas("tilecache-after-erosion", *chf);
 
   rcHeightfieldLayerSet *lset = rcAllocHeightfieldLayerSet();
   if (!lset || !rcBuildHeightfieldLayers(ctx, *chf, cfg.borderSize,
@@ -1331,6 +1501,12 @@ collectRequiredSemanticAreas(const Mesh &mesh, const BuildBounds &bounds) {
 
 static std::vector<ObstacleProbe> collectObstacleProbes(const Mesh &mesh) {
   std::vector<ObstacleProbe> probes;
+  std::map<int, std::vector<int>> walkableByObject;
+  for (size_t tri = 0; tri < mesh.triangleSemantics.size(); ++tri) {
+    const SemanticSpec *spec = semanticSpec(mesh.triangleSemantics[tri]);
+    if (spec && spec->area != RC_NULL_AREA)
+      walkableByObject[mesh.triangleObjects[tri]].push_back((int)tri);
+  }
   for (size_t tri = 0; tri < mesh.triangleSemantics.size(); ++tri) {
     if (mesh.triangleSemantics[tri] != NavSemantic::ObstacleStatic)
       continue;
@@ -1345,9 +1521,53 @@ static std::vector<ObstacleProbe> collectObstacleProbes(const Mesh &mesh) {
               rcSqr(ab[0] * ac[1] - ab[1] * ac[0]));
     if (normalLength <= 1e-5f || fabsf(normalY) / normalLength < 0.75f)
       continue; // probes target horizontal blocker footprint faces
-    probes.push_back({(a[0] + b[0] + c[0]) / 3.0f,
-                      (a[1] + b[1] + c[1]) / 3.0f,
-                      (a[2] + b[2] + c[2]) / 3.0f});
+    // Sub-cell paper scraps, trim, and similar decoration cannot own a stable
+    // voxel center and therefore cannot be required to produce an individual
+    // navigation hole. Larger props remain verified, and their final
+    // agent-radius clearance is still provided by erosion.
+    const float projectedArea = fabsf(normalY) * 0.5f;
+    if (projectedArea < CELL_SIZE * CELL_SIZE * 0.25f)
+      continue;
+    const ObstacleProbe probe{(a[0] + b[0] + c[0]) / 3.0f,
+                              (a[1] + b[1] + c[1]) / 3.0f,
+                              (a[2] + b[2] + c[2]) / 3.0f};
+    // Verification follows the same cell-level precedence as carving. A
+    // component-specific walkable face on this OBJ object may intentionally
+    // replace its coarse default obstacle face. Quantize to the raster cell
+    // center because sub-cell conflicts cannot exist as separate nav spans.
+    const float sampleX =
+        mesh.bmin[0] +
+        (floorf((probe.x - mesh.bmin[0]) / CELL_SIZE) + 0.5f) * CELL_SIZE;
+    const float sampleZ =
+        mesh.bmin[2] +
+        (floorf((probe.z - mesh.bmin[2]) / CELL_SIZE) + 0.5f) * CELL_SIZE;
+    bool overriddenBySpecificWalkable = false;
+    const auto walkable = walkableByObject.find(mesh.triangleObjects[tri]);
+    if (walkable != walkableByObject.end()) {
+      const float tolerance =
+          std::max(CELL_HEIGHT * 2.0f,
+                   CELL_HEIGHT * DETAIL_SAMPLE_MAX_ERR);
+      for (int walkableTri : walkable->second) {
+        const float *wa =
+            &mesh.verts[mesh.tris[walkableTri * 3 + 0] * 3];
+        const float *wb =
+            &mesh.verts[mesh.tris[walkableTri * 3 + 1] * 3];
+        const float *wc =
+            &mesh.verts[mesh.tris[walkableTri * 3 + 2] * 3];
+        float walkableY = 0.0f;
+        if (triangleOverlapsCellXZ(wa, wb, wc, sampleX - CELL_SIZE * 0.5f,
+                                   sampleZ - CELL_SIZE * 0.5f,
+                                   sampleX + CELL_SIZE * 0.5f,
+                                   sampleZ + CELL_SIZE * 0.5f) &&
+            trianglePlaneHeightXZ(wa, wb, wc, sampleX, sampleZ, walkableY) &&
+            fabsf(walkableY - probe.y) <= tolerance) {
+          overriddenBySpecificWalkable = true;
+          break;
+        }
+      }
+    }
+    if (!overriddenBySpecificWalkable)
+      probes.push_back(probe);
   }
   return probes;
 }
@@ -1437,11 +1657,23 @@ static bool inspectBakedSemantics(const char *label, const dtNavMesh &navMesh,
         for (int vertex = 0; vertex < poly.vertCount; ++vertex)
           averageY += tile->verts[poly.verts[vertex] * 3 + 1];
         averageY /= poly.vertCount;
-        if (fabsf(averageY - probe.y) <= AGENT_HEIGHT) {
+        // An obstacle surface invalidates a walkable span at the same height,
+        // or below it without enough agent headroom. A polygon on a distinct
+        // floor above the obstacle is valid multi-storey topology and must not
+        // be rejected merely because the two layers are less than one agent
+        // height apart. Allow only raster/detail quantization above the probe.
+        const float verticalQuantizationTolerance =
+            std::max(CELL_HEIGHT * 2.0f,
+                     CELL_HEIGHT * DETAIL_SAMPLE_MAX_ERR);
+        const float clearanceAboveWalkable = probe.y - averageY;
+        if (clearanceAboveWalkable >= -verticalQuantizationTolerance &&
+            clearanceAboveWalkable <= AGENT_HEIGHT) {
           fprintf(stderr,
                   "%s semantic inspection failed: walkable area %u covers "
-                  "nav_obstacle_static probe (%.2f, %.2f, %.2f)\n",
-                  label, poly.getArea(), probe.x, probe.y, probe.z);
+                  "nav_obstacle_static probe (%.2f, %.2f, %.2f; "
+                  "polygonY=%.2f clearance=%.2f)\n",
+                  label, poly.getArea(), probe.x, probe.y, probe.z, averageY,
+                  clearanceAboveWalkable);
           return false;
         }
       }
@@ -1917,7 +2149,14 @@ int main(int argc, char *argv[]) {
       return 1;
     }
     dtNavMesh *cacheNavMesh = dtAllocNavMesh();
-    if (!cacheNavMesh || dtStatusFailed(cacheNavMesh->init(&nmParams))) {
+    dtNavMeshParams cacheInspectionParams = nmParams;
+    const int cacheNavTileBits = std::min(
+        (int)ilog2(nextPow2((unsigned int)std::max(totalCacheLayers, 1))),
+        22 - 7);
+    cacheInspectionParams.maxTiles = 1 << cacheNavTileBits;
+    cacheInspectionParams.maxPolys = 1 << (22 - cacheNavTileBits);
+    if (!cacheNavMesh ||
+        dtStatusFailed(cacheNavMesh->init(&cacheInspectionParams))) {
       fprintf(stderr, "Cannot initialize TileCache semantic inspection mesh\n");
       dtFreeNavMesh(cacheNavMesh);
       dtFreeNavMesh(navMesh);
@@ -1926,10 +2165,13 @@ int main(int argc, char *argv[]) {
     }
     bool cacheBuildOk = true;
     for (const auto &[tx, ty] : tileList) {
-      if (dtStatusFailed(tileCache->buildNavMeshTilesAt(tx, ty, cacheNavMesh))) {
+      const dtStatus buildStatus =
+          tileCache->buildNavMeshTilesAt(tx, ty, cacheNavMesh);
+      if (dtStatusFailed(buildStatus)) {
         fprintf(stderr,
-                "TileCache semantic inspection failed to materialize (%d,%d)\n",
-                tx, ty);
+                "TileCache semantic inspection failed to materialize "
+                "(%d,%d), status=0x%08x\n",
+                tx, ty, buildStatus);
         cacheBuildOk = false;
         break;
       }

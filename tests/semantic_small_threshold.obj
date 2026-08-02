@@ -1,0 +1,20 @@
+# A deliberately short doorway strip embedded in a larger floor. It is an
+# authored semantic transition, not region noise, and must survive Recast's
+# global small-region pruning.
+o surrounding_floor
+v -2 0 -2
+v 4 0 -2
+v 4 0 2
+v -2 0 2
+usemtl nav_floor_interior
+f 1 4 3
+f 1 3 2
+
+o doorway_threshold
+v 0 0 0
+v 2 0 0
+v 2 0 0.4
+v 0 0 0.4
+usemtl nav_threshold
+f 5 8 7
+f 5 7 6

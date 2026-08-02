@@ -70,6 +70,22 @@ Pre-semantic OBJ files are supported only with the explicit
 `--legacy-object-fallback` option. This enables the historical object-name
 rules without allowing them to override canonical semantic faces.
 
+Strict semantic collision is applied at the source triangle's voxel footprint,
+not its axis-aligned bounding box. Component-specific walkable faces may
+override a coplanar coarse `nav_obstacle_static` face only when both belong to
+the same OBJ object; a separate prop object at the same location still blocks
+navigation. Explicit semantic obstacles also bypass Recast's legacy
+low-hanging-obstacle promotion, which can otherwise turn a tagged blocker back
+into a walkable span.
+
+Canonical semantic regions are authored topology, so `--region-min` pruning is
+disabled for semantic input. Short thresholds and individual stair components
+must survive once classified; decoration/noise rejection belongs in the
+classifier. `--region-min` continues to apply to
+`--legacy-object-fallback` input. Set `H1EMU_NAV_DEBUG_SEMANTIC_STAGES=1` to log
+compact-heightfield area histograms before carving, after carving, and after
+erosion while diagnosing a regional bake.
+
 Every run writes `<output>.semantics.json` with the semantic contract,
 deterministic material histogram, taxonomy, warnings, normalized input basename
 and content identity, dynamic-door acknowledgement, and legacy-mode state. It
@@ -78,7 +94,12 @@ choose another path.
 `--validate-semantics-only --require-all-semantics` validates a fixture without
 building any tiles. `--verify-baked-semantics` additionally inspects direct and
 materialized TileCache polygons after a bake, including static-obstacle
-footprint probes. With `--bounds`, retained area IDs are required only for
+footprint probes. Obstacle checks are multi-storey aware: they reject a
+walkable span at the obstacle layer or below it without enough headroom, but do
+not reject an independent floor above the blocker. Individual obstacle faces
+smaller than one quarter of a raster cell are not required to own a stable
+probe; larger source blockers and their eroded agent-radius clearance remain
+verified. With `--bounds`, retained area IDs are required only for
 canonical source triangles that have non-zero X/Z overlap with the requested
 bounds and pass the configured Recast slope test. Materials found only in the
 rest of a source chunk cannot make a regional verification fail; in-bounds
