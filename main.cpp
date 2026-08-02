@@ -2037,6 +2037,19 @@ int main(int argc, char *argv[]) {
     for (int tx = firstTx; tx < lastTx; ++tx)
       tileList.push_back({tx, ty});
 
+  struct PendingTileCacheLayer {
+    int tx;
+    int ty;
+    int layer;
+    unsigned char *data;
+    int dataSize;
+  };
+  // Parallel workers own independent slots. dtTileCache insertion happens
+  // later in canonical (ty, tx, layer) order, so OpenMP completion order can
+  // never change tile refs or serialized artifact bytes.
+  std::vector<std::vector<PendingTileCacheLayer>> pendingCacheLayers(
+      (size_t)totalTiles);
+
   std::mutex navMeshMutex; // guards writes and progress counters
   int processed = 0;
 
@@ -2064,6 +2077,24 @@ int main(int argc, char *argv[]) {
     PrintContext cacheCtx(tx, ty);
     auto cacheLayers =
         buildTileCacheLayers(&cacheCtx, mesh, grid, tmin, tmax, tx, ty);
+    std::vector<PendingTileCacheLayer> &pending =
+        pendingCacheLayers[(size_t)i];
+    pending.reserve(cacheLayers.size());
+    for (const auto &[layerData, layerSize] : cacheLayers) {
+      const dtTileCacheLayerHeader *header =
+          reinterpret_cast<const dtTileCacheLayerHeader *>(layerData);
+      pending.push_back(
+          {header->tx, header->ty, header->tlayer, layerData, layerSize});
+    }
+    std::sort(pending.begin(), pending.end(),
+              [](const PendingTileCacheLayer &left,
+                 const PendingTileCacheLayer &right) {
+                if (left.ty != right.ty)
+                  return left.ty < right.ty;
+                if (left.tx != right.tx)
+                  return left.tx < right.tx;
+                return left.layer < right.layer;
+              });
 
     {
       std::lock_guard<std::mutex> lock(navMeshMutex);
@@ -2084,23 +2115,12 @@ int main(int argc, char *argv[]) {
             totalPolys += tile->header->polyCount;
         }
       }
-      int layersThisTile = (int)cacheLayers.size();
+      int layersThisTile = (int)pending.size();
       if (tileCtx.hadError || cacheCtx.hadError)
         failedRecastTiles++;
       totalCacheLayers += layersThisTile;
       if (layersThisTile > maxLayersPerTile)
         maxLayersPerTile = layersThisTile;
-      for (auto &[ldata, lsize] : cacheLayers) {
-        dtStatus addStatus = tileCache->addTile(
-            ldata, lsize, DT_COMPRESSEDTILE_FREE_DATA, nullptr);
-        if (dtStatusFailed(addStatus)) {
-          fprintf(stderr,
-                  "\n[WARN]  tileCache->addTile failed (tx=%d ty=%d) — "
-                  "maxTiles=%d may be too low\n",
-                  tx, ty, tcParams.maxTiles);
-          dtFree(ldata);
-        }
-      }
       processed++;
       printProgress(processed, totalTiles, builtTiles, totalNavBytes,
                     elapsed(tBuild));
@@ -2128,9 +2148,28 @@ int main(int argc, char *argv[]) {
             "\n[ERROR] Navmesh build failed in %d tile(s); refusing to write "
             "a partial cache.\n",
             failedRecastTiles);
+    for (auto &layers : pendingCacheLayers)
+      for (PendingTileCacheLayer &layer : layers)
+        dtFree(layer.data);
     dtFreeNavMesh(navMesh);
     dtFreeTileCache(tileCache);
     return 1;
+  }
+
+  for (std::vector<PendingTileCacheLayer> &layers : pendingCacheLayers) {
+    for (PendingTileCacheLayer &layer : layers) {
+      const dtStatus addStatus = tileCache->addTile(
+          layer.data, layer.dataSize, DT_COMPRESSEDTILE_FREE_DATA, nullptr);
+      if (dtStatusFailed(addStatus)) {
+        fprintf(stderr,
+                "\n[WARN]  tileCache->addTile failed (tx=%d ty=%d layer=%d) "
+                "— maxTiles=%d may be too low\n",
+                layer.tx, layer.ty, layer.layer, tcParams.maxTiles);
+        dtFree(layer.data);
+      }
+      // addTile owns successful data; a failed add was freed above.
+      layer.data = nullptr;
+    }
   }
 
   if (options.verifyBakedSemantics) {

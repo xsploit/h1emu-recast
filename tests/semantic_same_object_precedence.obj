@@ -1,0 +1,118 @@
+# Coplanar semantic faces exercise Recast's real span merge priority. The
+# first two islands reverse source order to prove that priority follows area
+# identity, not OBJ ordering. nav_threshold is the canonical door traversal
+# surface; dynamic door panels and nav_exclude are removed by the OBJ parser.
+o semantic_precedence
+v 0 0 0
+v 4 0 0
+v 0 0 4
+v 6 0 0
+v 10 0 0
+v 6 0 4
+v 12 0 0
+v 16 0 0
+v 12 0 4
+v 18 0 0
+v 22 0 0
+v 18 0 4
+v 24 0 0
+v 28 0 0
+v 24 0 4
+v 30 0 0
+v 34 0 0
+v 30 0 4
+v 36 0 0
+v 40 0 0
+v 36 0 4
+v 42 0 0
+v 46 0 0
+v 42 0 4
+v 48 0 0
+v 52 0 0
+v 48 0 4
+
+# Door threshold wins over stair, interior, exterior, and road (low to high).
+usemtl nav_road
+f 1 3 2
+usemtl nav_floor_exterior
+f 1 3 2
+usemtl nav_floor_interior
+f 1 3 2
+usemtl nav_stair
+f 1 3 2
+usemtl nav_threshold
+f 1 3 2
+usemtl nav_door_panel_dynamic
+f 1 3 2
+usemtl nav_exclude
+f 1 3 2
+
+# The same door precedence in reverse source order.
+usemtl nav_threshold
+f 4 6 5
+usemtl nav_stair
+f 4 6 5
+usemtl nav_floor_interior
+f 4 6 5
+usemtl nav_floor_exterior
+f 4 6 5
+usemtl nav_road
+f 4 6 5
+
+# Stair wins over lower-priority walkable semantics in both source orders.
+usemtl nav_road
+f 7 9 8
+usemtl nav_floor_exterior
+f 7 9 8
+usemtl nav_floor_interior
+f 7 9 8
+usemtl nav_stair
+f 7 9 8
+usemtl nav_stair
+f 10 12 11
+usemtl nav_floor_interior
+f 10 12 11
+usemtl nav_floor_exterior
+f 10 12 11
+usemtl nav_road
+f 10 12 11
+
+# Interior wins over exterior/road; exterior wins over road; road remains road.
+usemtl nav_road
+f 13 15 14
+usemtl nav_floor_exterior
+f 13 15 14
+usemtl nav_floor_interior
+f 13 15 14
+usemtl nav_road
+f 16 18 17
+usemtl nav_floor_exterior
+f 16 18 17
+usemtl nav_road
+f 19 21 20
+
+# A component-specific walkable face protects its coplanar same-object span
+# from the coarse obstacle face.
+usemtl nav_floor_exterior
+f 22 24 23
+usemtl nav_obstacle_static
+f 22 24 23
+
+# An excluded-only island contributes no baked topology.
+usemtl nav_exclude
+f 25 27 26
+
+# A blocker in a distinct object must still carve the overlapping floor.
+o separate_walkable
+v 54 0 0
+v 58 0 0
+v 54 0 4
+usemtl nav_floor_exterior
+f 28 30 29
+
+o separate_blocker
+v 54 0 0
+v 58 0 0
+v 54 0 4
+usemtl nav_obstacle_static
+f 31 33 32

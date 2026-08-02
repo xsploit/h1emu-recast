@@ -152,6 +152,14 @@ if(BUILD_TESTING)
             --semantic-report ${CMAKE_BINARY_DIR}/semantic-small-threshold/semantics.json
     )
 
+    add_test(NAME semantic-same-object-precedence
+        COMMAND ${CMAKE_COMMAND}
+            -DBUILDER=$<TARGET_FILE:navmesh-builder>
+            -DSOURCE_DIR=${CMAKE_SOURCE_DIR}
+            -DOUTPUT_DIR=${CMAKE_BINARY_DIR}/semantic-same-object-precedence
+            -P ${CMAKE_SOURCE_DIR}/tests/verify_semantic_same_object_precedence.cmake
+    )
+
     add_test(NAME semantic-report-path-independent
         COMMAND ${CMAKE_COMMAND}
             -DBUILDER=$<TARGET_FILE:navmesh-builder>
