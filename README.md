@@ -38,6 +38,37 @@ full-map bake. Individual settings can be overridden with `--cell-size`,
 `--cell-height`, `--agent-height`, `--agent-radius`, `--agent-climb`,
 `--agent-slope`, `--tile-size`, `--region-min`, and `--region-merge`.
 
+For a regional artifact that will replace columns in an existing full cache,
+also pass `--global-bounds minX minY minZ maxX maxY maxZ`. This keeps the
+regional bake in the full cache's exact origin, tile-coordinate system, and
+capacity even though `--bounds` limits the work. The global extent and every
+profile/voxel/agent setting must match the destination cache exactly.
+
+## Deterministic regional TileCache overlays
+
+`tilecache-overlay` replaces complete `(tx,ty)` columns in a full cache. It
+never combines individual layers from the old and new versions of one column.
+The regional source must include at least a one-tile geometry halo on every
+side of the smaller replacement rectangle; halo layers are validated but are
+not copied into the result.
+
+```sh
+./build/tilecache-overlay \
+  --base-dir ./full-cache \
+  --overlay-dir ./regional-cache \
+  --output-dir ./merged-cache \
+  --replace-coverage 148 112 152 118 \
+  --overlay-coverage 146 110 153 119
+```
+
+Both rectangles use half-open tile coordinates. Inputs are rejected on part
+gaps, malformed/trailing payloads, duplicate or non-contiguous layers,
+coordinate/bounds inconsistencies, or any origin, capacity, voxel, walkability,
+or simplification mismatch. Output records are sorted canonically, assigned
+deterministic references, split deterministically, re-read for verification,
+and accompanied by a SHA-256 report. The output directory must not already
+exist, which prevents a failed run from mixing new parts with stale ones.
+
 ## Semantic geometry contract
 
 Semantic OBJ input assigns every face exactly one canonical `usemtl` value:

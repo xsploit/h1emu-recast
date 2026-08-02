@@ -30,6 +30,13 @@ target_include_directories(navmesh-builder PRIVATE
     ${RECAST_DIR}/RecastDemo/Contrib/fastlz
 )
 
+add_executable(tilecache-overlay tilecache_overlay.cpp)
+
+target_include_directories(tilecache-overlay PRIVATE
+    ${RECAST_DIR}/Detour/Include
+    ${RECAST_DIR}/DetourTileCache/Include
+)
+
 target_compile_definitions(navmesh-builder PRIVATE
     # Dense multi-storey interiors can exceed Recast's conservative default
     # of 63 overlapping heightfield layers. Layer ids are stored as bytes, so
@@ -40,15 +47,21 @@ target_compile_definitions(navmesh-builder PRIVATE
 if(MSVC)
     target_compile_options(navmesh-builder PRIVATE /W4 /O2 /fp:fast)
     target_compile_definitions(navmesh-builder PRIVATE _CRT_SECURE_NO_WARNINGS)
+    target_compile_options(tilecache-overlay PRIVATE /W4 /O2)
+    target_compile_definitions(tilecache-overlay PRIVATE _CRT_SECURE_NO_WARNINGS)
 else()
     target_compile_options(navmesh-builder PRIVATE
         -Wall -Wextra
         -march=native
         -ffast-math
     )
+    target_compile_options(tilecache-overlay PRIVATE -Wall -Wextra)
 endif()
 
 if(BUILD_TESTING)
+    add_test(NAME tilecache-overlay-self-test
+        COMMAND tilecache-overlay --self-test)
+
     add_test(NAME semantic-contract
         COMMAND navmesh-builder
             ${CMAKE_SOURCE_DIR}/tests/semantic_contract.obj
@@ -166,6 +179,15 @@ if(BUILD_TESTING)
             -DSOURCE_DIR=${CMAKE_SOURCE_DIR}
             -DOUTPUT_DIR=${CMAKE_BINARY_DIR}/semantic-report-paths
             -P ${CMAKE_SOURCE_DIR}/tests/verify_path_independent_report.cmake
+    )
+
+    add_test(NAME global-bounds-overlay-contract
+        COMMAND ${CMAKE_COMMAND}
+            -DBUILDER=$<TARGET_FILE:navmesh-builder>
+            -DOVERLAY=$<TARGET_FILE:tilecache-overlay>
+            -DSOURCE_DIR=${CMAKE_SOURCE_DIR}
+            -DOUTPUT_DIR=${CMAKE_BINARY_DIR}/global-bounds-overlay
+            -P ${CMAKE_SOURCE_DIR}/tests/verify_global_bounds_overlay.cmake
     )
 endif()
 

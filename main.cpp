@@ -200,8 +200,15 @@ struct BuildBounds {
   float maxZ = 0.0f;
 };
 
+struct GlobalBounds {
+  bool enabled = false;
+  float bmin[3] = {};
+  float bmax[3] = {};
+};
+
 struct BuildOptions {
   BuildBounds bounds;
+  GlobalBounds globalBounds;
   bool legacyObjectFallback = false;
   bool dynamicDoorObstacles = false;
   bool validateSemanticsOnly = false;
@@ -1704,6 +1711,8 @@ static void printUsage(const char *program) {
           "  --region-merge <voxels>     Region merge size\n"
           "  --bounds <minX> <minZ> <maxX> <maxZ>\n"
           "                              Build only intersecting global tiles\n"
+          "  --global-bounds <minX> <minY> <minZ> <maxX> <maxY> <maxZ>\n"
+          "                              Fix origin/capacity to a full-world extent\n"
           "  --legacy-object-fallback   Enable pre-semantic object-name rules\n"
           "  --dynamic-door-obstacles  Acknowledge required runtime door blockers\n"
           "  --semantic-report <path>  Write deterministic semantic provenance\n"
@@ -1780,6 +1789,21 @@ static bool parseOptions(int argc, char *argv[], int start,
       }
       options.bounds.enabled = true;
       i += 4;
+      continue;
+    }
+    if (strcmp(arg, "--global-bounds") == 0) {
+      if (i + 6 >= argc ||
+          !parseFloat(argv[i + 1], options.globalBounds.bmin[0]) ||
+          !parseFloat(argv[i + 2], options.globalBounds.bmin[1]) ||
+          !parseFloat(argv[i + 3], options.globalBounds.bmin[2]) ||
+          !parseFloat(argv[i + 4], options.globalBounds.bmax[0]) ||
+          !parseFloat(argv[i + 5], options.globalBounds.bmax[1]) ||
+          !parseFloat(argv[i + 6], options.globalBounds.bmax[2])) {
+        fprintf(stderr, "Invalid --global-bounds values\n");
+        return false;
+      }
+      options.globalBounds.enabled = true;
+      i += 6;
       continue;
     }
     if (strcmp(arg, "--legacy-object-fallback") == 0) {
@@ -1866,6 +1890,21 @@ static bool parseOptions(int argc, char *argv[], int start,
     fprintf(stderr, "Invalid build bounds\n");
     return false;
   }
+  if (options.globalBounds.enabled &&
+      (options.globalBounds.bmin[0] >= options.globalBounds.bmax[0] ||
+       options.globalBounds.bmin[1] >= options.globalBounds.bmax[1] ||
+       options.globalBounds.bmin[2] >= options.globalBounds.bmax[2])) {
+    fprintf(stderr, "Invalid global build bounds\n");
+    return false;
+  }
+  if (options.bounds.enabled && options.globalBounds.enabled &&
+      (options.bounds.minX < options.globalBounds.bmin[0] ||
+       options.bounds.minZ < options.globalBounds.bmin[2] ||
+       options.bounds.maxX > options.globalBounds.bmax[0] ||
+       options.bounds.maxZ > options.globalBounds.bmax[2])) {
+    fprintf(stderr, "Build bounds must be contained by --global-bounds\n");
+    return false;
+  }
   return true;
 }
 
@@ -1917,8 +1956,18 @@ int main(int argc, char *argv[]) {
              mesh.bmin, mesh.bmax, (float)TILE_SIZE * CELL_SIZE);
   printf(" done (%.2fs)\n", elapsed(tIdx));
 
+  float worldBmin[3];
+  float worldBmax[3];
+  if (options.globalBounds.enabled) {
+    rcVcopy(worldBmin, options.globalBounds.bmin);
+    rcVcopy(worldBmax, options.globalBounds.bmax);
+  } else {
+    rcVcopy(worldBmin, mesh.bmin);
+    rcVcopy(worldBmax, mesh.bmax);
+  }
+
   int gw = 0, gh = 0;
-  rcCalcGridSize(mesh.bmin, mesh.bmax, CELL_SIZE, &gw, &gh);
+  rcCalcGridSize(worldBmin, worldBmax, CELL_SIZE, &gw, &gh);
   const int tw = (gw + TILE_SIZE - 1) / TILE_SIZE;
   const int th = (gh + TILE_SIZE - 1) / TILE_SIZE;
   const float tileWorldSize = (float)TILE_SIZE * CELL_SIZE;
@@ -1928,16 +1977,16 @@ int main(int argc, char *argv[]) {
   int lastTy = th;
   if (options.bounds.enabled) {
     firstTx = std::clamp(
-        (int)floorf((options.bounds.minX - mesh.bmin[0]) / tileWorldSize), 0,
+        (int)floorf((options.bounds.minX - worldBmin[0]) / tileWorldSize), 0,
         tw);
     firstTy = std::clamp(
-        (int)floorf((options.bounds.minZ - mesh.bmin[2]) / tileWorldSize), 0,
+        (int)floorf((options.bounds.minZ - worldBmin[2]) / tileWorldSize), 0,
         th);
     lastTx = std::clamp(
-        (int)ceilf((options.bounds.maxX - mesh.bmin[0]) / tileWorldSize), 0,
+        (int)ceilf((options.bounds.maxX - worldBmin[0]) / tileWorldSize), 0,
         tw);
     lastTy = std::clamp(
-        (int)ceilf((options.bounds.maxZ - mesh.bmin[2]) / tileWorldSize), 0,
+        (int)ceilf((options.bounds.maxZ - worldBmin[2]) / tileWorldSize), 0,
         th);
   }
   const int totalTiles = (lastTx - firstTx) * (lastTy - firstTy);
@@ -1946,8 +1995,17 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
-  const int tileBits =
-      rcMin((int)ilog2(nextPow2((unsigned int)totalTiles)), 14);
+  const long long fullTileCount = (long long)tw * (long long)th;
+  if (fullTileCount <= 0 || fullTileCount > 0x3fffffffLL) {
+    fprintf(stderr, "Global tile grid is outside supported capacity\n");
+    return 1;
+  }
+  // Preserve historical bounded-bake sizing unless a caller explicitly asks
+  // for compatibility with a larger full-world cache.
+  const long long capacityTileCount =
+      options.globalBounds.enabled ? fullTileCount : totalTiles;
+  const int tileBits = rcMin(
+      (int)ilog2(nextPow2((unsigned int)capacityTileCount)), 14);
   const int maxTiles = 1 << tileBits;
   const int maxPolysPerTile = 1 << (22 - tileBits);
 
@@ -1962,7 +2020,7 @@ int main(int argc, char *argv[]) {
          AGENT_HEIGHT, AGENT_RADIUS, AGENT_MAX_CLIMB, AGENT_MAX_SLOPE);
 
   dtNavMeshParams nmParams{};
-  rcVcopy(nmParams.orig, mesh.bmin);
+  rcVcopy(nmParams.orig, worldBmin);
   nmParams.tileWidth = (float)TILE_SIZE * CELL_SIZE;
   nmParams.tileHeight = (float)TILE_SIZE * CELL_SIZE;
   nmParams.maxTiles = maxTiles;
@@ -1976,7 +2034,7 @@ int main(int argc, char *argv[]) {
   }
 
   dtTileCacheParams tcParams{};
-  rcVcopy(tcParams.orig, mesh.bmin);
+  rcVcopy(tcParams.orig, worldBmin);
   tcParams.cs = CELL_SIZE;
   tcParams.ch = CELL_HEIGHT;
   tcParams.width = TILE_SIZE;
@@ -1985,7 +2043,14 @@ int main(int argc, char *argv[]) {
   tcParams.walkableRadius = AGENT_RADIUS;
   tcParams.walkableClimb = AGENT_MAX_CLIMB;
   tcParams.maxSimplificationError = EDGE_MAX_ERROR;
-  const int rawMaxTiles = totalTiles * EXPECTED_LAYERS_PER_TILE;
+  const long long rawMaxTiles64 =
+      capacityTileCount * (long long)EXPECTED_LAYERS_PER_TILE;
+  if (rawMaxTiles64 <= 0 || rawMaxTiles64 > 0x3fffffffLL) {
+    fprintf(stderr, "Global TileCache grid is outside supported capacity\n");
+    dtFreeNavMesh(navMesh);
+    return 1;
+  }
+  const int rawMaxTiles = (int)rawMaxTiles64;
   const int tcTileBits = (int)ilog2(nextPow2((unsigned int)rawMaxTiles));
   const int cappedMaxTiles = 1 << tcTileBits;
   tcParams.maxTiles = cappedMaxTiles;
@@ -2062,12 +2127,12 @@ int main(int argc, char *argv[]) {
     const auto [tx, ty] = tileList[i];
 
     float tmin[3], tmax[3];
-    tmin[0] = mesh.bmin[0] + (float)tx * tileWorldSize;
-    tmin[1] = mesh.bmin[1];
-    tmin[2] = mesh.bmin[2] + (float)ty * tileWorldSize;
-    tmax[0] = mesh.bmin[0] + (float)(tx + 1) * tileWorldSize;
-    tmax[1] = mesh.bmax[1];
-    tmax[2] = mesh.bmin[2] + (float)(ty + 1) * tileWorldSize;
+    tmin[0] = worldBmin[0] + (float)tx * tileWorldSize;
+    tmin[1] = worldBmin[1];
+    tmin[2] = worldBmin[2] + (float)ty * tileWorldSize;
+    tmax[0] = worldBmin[0] + (float)(tx + 1) * tileWorldSize;
+    tmax[1] = worldBmax[1];
+    tmax[2] = worldBmin[2] + (float)(ty + 1) * tileWorldSize;
 
     PrintContext tileCtx(tx, ty);
     int dataSize = 0;
@@ -2371,11 +2436,11 @@ int main(int argc, char *argv[]) {
       header.numTiles = (int)cacheTiles.size();
 
       dtNavMeshParams tcMeshParams{};
-      rcVcopy(tcMeshParams.orig, mesh.bmin);
+      rcVcopy(tcMeshParams.orig, worldBmin);
       tcMeshParams.tileWidth = (float)TILE_SIZE * CELL_SIZE;
       tcMeshParams.tileHeight = (float)TILE_SIZE * CELL_SIZE;
-      const int tcNavTileBits =
-          std::min((int)ilog2(nextPow2((unsigned int)cacheTiles.size())), 22 - 7);
+      const int tcNavTileBits = std::min(
+          (int)ilog2(nextPow2((unsigned int)rawMaxTiles)), 22 - 7);
       tcMeshParams.maxTiles = 1 << tcNavTileBits;
       tcMeshParams.maxPolys = 1 << (22 - tcNavTileBits);
 
