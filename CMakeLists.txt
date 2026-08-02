@@ -55,8 +55,17 @@ if(BUILD_TESTING)
             ${CMAKE_BINARY_DIR}/semantic-contract.bin
             --validate-semantics-only
             --require-all-semantics
+            --dynamic-door-obstacles
             --semantic-report ${CMAKE_BINARY_DIR}/semantic-contract.json
     )
+    add_test(NAME semantic-dynamic-door-requires-ack
+        COMMAND navmesh-builder
+            ${CMAKE_SOURCE_DIR}/tests/semantic_contract.obj
+            ${CMAKE_BINARY_DIR}/semantic-door-rejected.bin
+            --validate-semantics-only
+    )
+    set_tests_properties(semantic-dynamic-door-requires-ack
+        PROPERTIES WILL_FAIL TRUE)
     add_test(NAME semantic-invalid-material
         COMMAND navmesh-builder
             ${CMAKE_SOURCE_DIR}/tests/invalid_semantic.obj
@@ -97,6 +106,26 @@ if(BUILD_TESTING)
             --legacy-object-fallback
             --validate-semantics-only
             --semantic-report ${CMAKE_BINARY_DIR}/semantic-legacy.json
+    )
+
+    add_test(NAME semantic-bounded-bake
+        COMMAND navmesh-builder
+            ${CMAKE_SOURCE_DIR}/tests/bake_semantics.obj
+            ${CMAKE_BINARY_DIR}/semantic-bake/output.bin
+            --profile human
+            --region-min 1
+            --region-merge 1
+            --dynamic-door-obstacles
+            --verify-baked-semantics
+            --semantic-report ${CMAKE_BINARY_DIR}/semantic-bake/semantics.json
+    )
+
+    add_test(NAME semantic-report-path-independent
+        COMMAND ${CMAKE_COMMAND}
+            -DBUILDER=$<TARGET_FILE:navmesh-builder>
+            -DSOURCE_DIR=${CMAKE_SOURCE_DIR}
+            -DOUTPUT_DIR=${CMAKE_BINARY_DIR}/semantic-report-paths
+            -P ${CMAKE_SOURCE_DIR}/tests/verify_path_independent_report.cmake
     )
 endif()
 
