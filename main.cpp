@@ -14,6 +14,11 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 #ifdef USE_OPENMP
 #include <omp.h>
 #endif
@@ -26,6 +31,7 @@
 #include "DetourTileCacheBuilder.h"
 #include "Recast.h"
 #include "fastlz.h"
+#include "forgelight_nav_source.h"
 
 struct TriGrid {
   std::vector<std::vector<int>> cells;
@@ -702,6 +708,8 @@ static std::string jsonEscape(const std::string &value) {
 
 static std::string fnv1a64File(const char *path) {
   std::ifstream input(path, std::ios::binary);
+  if (!input)
+    return {};
   unsigned long long hash = 14695981039346656037ULL;
   char buffer[64 * 1024];
   while (input) {
@@ -712,13 +720,105 @@ static std::string fnv1a64File(const char *path) {
       hash *= 1099511628211ULL;
     }
   }
+  if (input.bad())
+    return {};
   std::ostringstream result;
   result << std::hex << std::setw(16) << std::setfill('0') << hash;
   return result.str();
 }
 
+static std::string sha256File(const std::filesystem::path &path) {
+  try {
+    return h1emu::nav::sha256Hex(
+        h1emu::nav::sha256(h1emu::nav::readFileBytes(path)));
+  } catch (const std::exception &) {
+    return {};
+  }
+}
+
+struct SemanticReportArtifact {
+  std::string role;
+  std::filesystem::path path;
+};
+
+static std::filesystem::path semanticReportTempPath(
+    const std::filesystem::path &reportPath) {
+  std::filesystem::path tempPath = reportPath;
+  tempPath += ".tmp";
+  return tempPath;
+}
+
+static bool clearSemanticReportPublication(const std::string &path) {
+  const std::filesystem::path reportPath(path);
+  const std::filesystem::path tempPath = semanticReportTempPath(reportPath);
+  for (const std::filesystem::path &candidate : {reportPath, tempPath}) {
+    std::error_code existsError;
+    const bool exists = std::filesystem::exists(candidate, existsError);
+    if (existsError) {
+      fprintf(stderr, "Cannot inspect semantic report path %s: %s\n",
+              candidate.string().c_str(), existsError.message().c_str());
+      return false;
+    }
+    if (!exists)
+      continue;
+    std::error_code typeError;
+    if (std::filesystem::is_directory(candidate, typeError)) {
+      fprintf(stderr, "Semantic report path is a directory: %s\n",
+              candidate.string().c_str());
+      return false;
+    }
+    if (typeError) {
+      fprintf(stderr, "Cannot inspect semantic report path %s: %s\n",
+              candidate.string().c_str(), typeError.message().c_str());
+      return false;
+    }
+    std::error_code removeError;
+    std::filesystem::remove(candidate, removeError);
+    if (removeError) {
+      fprintf(stderr, "Cannot clear semantic report path %s: %s\n",
+              candidate.string().c_str(), removeError.message().c_str());
+      return false;
+    }
+  }
+  return true;
+}
+
+static std::filesystem::path normalizedAbsolutePath(
+    const std::filesystem::path &path) {
+  std::error_code error;
+  const std::filesystem::path absolute = std::filesystem::absolute(path, error);
+  return (error ? path : absolute).lexically_normal();
+}
+
+static bool flushSyncClose(FILE *file, const std::string &path,
+                           const char *label) {
+  if (fflush(file) != 0) {
+    fprintf(stderr, "Cannot flush %s: %s\n", label, path.c_str());
+    fclose(file);
+    return false;
+  }
+#ifdef _WIN32
+  const int syncResult = _commit(_fileno(file));
+#else
+  const int syncResult = fsync(fileno(file));
+#endif
+  if (syncResult != 0) {
+    fprintf(stderr, "Cannot sync %s: %s\n", label, path.c_str());
+    fclose(file);
+    return false;
+  }
+  if (fclose(file) != 0) {
+    fprintf(stderr, "Cannot finalize %s: %s\n", label, path.c_str());
+    return false;
+  }
+  return true;
+}
+
 static bool writeSemanticReport(const char *inputPath, const std::string &path,
-                                const Mesh &mesh) {
+                                const Mesh &mesh,
+                                bool bakedSemanticsVerified,
+                                const std::vector<SemanticReportArtifact>
+                                    &artifacts = {}) {
   const std::filesystem::path reportPath(path);
   if (!reportPath.parent_path().empty()) {
     std::error_code error;
@@ -729,22 +829,60 @@ static bool writeSemanticReport(const char *inputPath, const std::string &path,
       return false;
     }
   }
-  std::ofstream report(reportPath, std::ios::binary | std::ios::trunc);
-  if (!report) {
-    fprintf(stderr, "Cannot write semantic report %s\n", path.c_str());
-    return false;
-  }
   std::error_code sizeError;
   const auto inputBytes = std::filesystem::file_size(inputPath, sizeError);
+  const std::string inputHash = fnv1a64File(inputPath);
+  const std::string inputSha256 = sha256File(inputPath);
+  if (sizeError || inputHash.empty() || inputSha256.empty()) {
+    fprintf(stderr, "Cannot bind semantic report input %s\n", inputPath);
+    return false;
+  }
   const std::string inputName =
       std::filesystem::path(inputPath).lexically_normal().filename().string();
-  const std::string inputHash = fnv1a64File(inputPath);
+  struct BoundArtifact {
+    std::string role;
+    std::string file;
+    uintmax_t bytes = 0;
+    std::string identity;
+    std::string sha256;
+  };
+  std::vector<BoundArtifact> boundArtifacts;
+  const std::filesystem::path normalizedReport =
+      normalizedAbsolutePath(reportPath);
+  for (const SemanticReportArtifact &artifact : artifacts) {
+    if (artifact.role.empty() || artifact.path.filename().empty()) {
+      fprintf(stderr, "Cannot bind unnamed semantic report artifact\n");
+      return false;
+    }
+    if (normalizedAbsolutePath(artifact.path) == normalizedReport) {
+      fprintf(stderr, "Semantic report path aliases output artifact %s\n",
+              artifact.path.string().c_str());
+      return false;
+    }
+    std::error_code artifactSizeError;
+    const uintmax_t artifactBytes =
+        std::filesystem::file_size(artifact.path, artifactSizeError);
+    const std::string artifactHash =
+        fnv1a64File(artifact.path.string().c_str());
+    const std::string artifactSha256 = sha256File(artifact.path);
+    if (artifactSizeError || artifactHash.empty() || artifactSha256.empty()) {
+      fprintf(stderr, "Cannot bind semantic report artifact %s\n",
+              artifact.path.string().c_str());
+      return false;
+    }
+    boundArtifacts.push_back({artifact.role, artifact.path.filename().string(),
+                              artifactBytes, "fnv1a64:" + artifactHash,
+                              artifactSha256});
+  }
+
+  std::ostringstream report;
   report << "{\n"
-         << "  \"schemaVersion\": 1,\n"
+         << "  \"schemaVersion\": 2,\n"
          << "  \"semanticContract\": \"" << SEMANTIC_CONTRACT << "\",\n"
          << "  \"inputName\": \"" << jsonEscape(inputName) << "\",\n"
          << "  \"inputBytes\": " << (sizeError ? 0 : inputBytes) << ",\n"
          << "  \"inputIdentity\": \"fnv1a64:" << inputHash << "\",\n"
+         << "  \"inputSha256\": \"" << inputSha256 << "\",\n"
          << "  \"semanticInput\": " << (mesh.semanticInput ? "true" : "false")
          << ",\n"
          << "  \"legacyObjectFallback\": "
@@ -752,6 +890,8 @@ static bool writeSemanticReport(const char *inputPath, const std::string &path,
          << "  \"dynamicDoorObstaclesAcknowledged\": "
          << (mesh.dynamicDoorObstaclesAcknowledged ? "true" : "false")
          << ",\n"
+         << "  \"bakedSemanticsVerified\": "
+         << (bakedSemanticsVerified ? "true" : "false") << ",\n"
          << "  \"sourceTriangles\": " << mesh.sourceTriangles << ",\n"
          << "  \"keptTriangles\": " << mesh.triangleSemantics.size() << ",\n"
          << "  \"excludedTriangles\": " << mesh.excludedSemanticTriangles
@@ -791,7 +931,75 @@ static bool writeSemanticReport(const char *inputPath, const std::string &path,
       report << ", ";
     report << "\"legacy fallback triangles are not semantically classified\"";
   }
-  report << "]\n}\n";
+  report << "],\n  \"artifacts\": [";
+  for (size_t i = 0; i < boundArtifacts.size(); ++i) {
+    const BoundArtifact &artifact = boundArtifacts[i];
+    if (i != 0)
+      report << ',';
+    report << "\n    {\"role\": \"" << jsonEscape(artifact.role)
+           << "\", \"file\": \"" << jsonEscape(artifact.file)
+           << "\", \"bytes\": " << artifact.bytes
+           << ", \"identity\": \"" << artifact.identity
+           << "\", \"sha256\": \"" << artifact.sha256 << "\"}";
+  }
+  if (!boundArtifacts.empty())
+    report << '\n';
+  report << "  ]\n}\n";
+
+  const std::filesystem::path tempPath = semanticReportTempPath(reportPath);
+  FILE *output = fopen(tempPath.string().c_str(), "wb");
+  if (!output) {
+    fprintf(stderr, "Cannot write semantic report temp file %s\n",
+            tempPath.string().c_str());
+    return false;
+  }
+  const std::string reportBytes = report.str();
+  if (fwrite(reportBytes.data(), 1, reportBytes.size(), output) !=
+      reportBytes.size()) {
+    fprintf(stderr, "Cannot write semantic report temp file %s\n",
+            tempPath.string().c_str());
+    fclose(output);
+    std::error_code cleanupError;
+    std::filesystem::remove(tempPath, cleanupError);
+    return false;
+  }
+  if (fflush(output) != 0) {
+    fprintf(stderr, "Cannot flush semantic report temp file %s\n",
+            tempPath.string().c_str());
+    fclose(output);
+    std::error_code cleanupError;
+    std::filesystem::remove(tempPath, cleanupError);
+    return false;
+  }
+#ifdef _WIN32
+  const int syncResult = _commit(_fileno(output));
+#else
+  const int syncResult = fsync(fileno(output));
+#endif
+  if (syncResult != 0) {
+    fprintf(stderr, "Cannot sync semantic report temp file %s\n",
+            tempPath.string().c_str());
+    fclose(output);
+    std::error_code cleanupError;
+    std::filesystem::remove(tempPath, cleanupError);
+    return false;
+  }
+  if (fclose(output) != 0) {
+    fprintf(stderr, "Cannot close semantic report temp file %s\n",
+            tempPath.string().c_str());
+    std::error_code cleanupError;
+    std::filesystem::remove(tempPath, cleanupError);
+    return false;
+  }
+  std::error_code renameError;
+  std::filesystem::rename(tempPath, reportPath, renameError);
+  if (renameError) {
+    fprintf(stderr, "Cannot publish semantic report %s: %s\n", path.c_str(),
+            renameError.message().c_str());
+    std::error_code cleanupError;
+    std::filesystem::remove(tempPath, cleanupError);
+    return false;
+  }
   printf("  Semantic provenance: %s\n", path.c_str());
   return true;
 }
@@ -1943,17 +2151,19 @@ int main(int argc, char *argv[]) {
 
   TimePoint tTotal = Clock::now();
 
-  Mesh mesh;
-  if (!loadObj(inputPath, mesh, options.legacyObjectFallback,
-               options.dynamicDoorObstacles))
-    return 1;
   if (options.semanticReportPath.empty())
     options.semanticReportPath = outputPath + ".semantics.json";
-  if (!writeSemanticReport(inputPath, options.semanticReportPath, mesh) ||
+  if (!clearSemanticReportPublication(options.semanticReportPath))
+    return 1;
+  Mesh mesh;
+  if (!loadObj(inputPath, mesh, options.legacyObjectFallback,
+               options.dynamicDoorObstacles) ||
       !validateSemanticContract(mesh, options.requireAllSemantics))
     return 1;
   if (options.validateSemanticsOnly) {
-    if (!validateSemanticRasterMapping(mesh))
+    if (!validateSemanticRasterMapping(mesh) ||
+        !writeSemanticReport(inputPath, options.semanticReportPath, mesh,
+                             false))
       return 1;
     return 0;
   }
@@ -2307,6 +2517,7 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
+  bool bakedSemanticsVerified = false;
   if (options.verifyBakedSemantics) {
     const std::map<unsigned int, long long> requiredSemanticAreas =
         collectRequiredSemanticAreas(mesh, options.bounds);
@@ -2359,6 +2570,7 @@ int main(int argc, char *argv[]) {
       return 1;
     }
     dtFreeNavMesh(cacheNavMesh);
+    bakedSemanticsVerified = true;
   }
 
   // split into 25 MB parts
@@ -2415,6 +2627,7 @@ int main(int argc, char *argv[]) {
   }
 
   TimePoint tSave = Clock::now();
+  size_t serializedNavMeshTiles = 0;
 
   for (size_t p = 0; p < parts.size(); p++) {
     const std::string partPath =
@@ -2435,7 +2648,14 @@ int main(int argc, char *argv[]) {
       header.version = NAVMESHSET_VERSION;
       header.numTiles = (int)tiles.size();
       memcpy(&header.params, cnm->getParams(), sizeof(dtNavMeshParams));
-      fwrite(&header, sizeof(header), 1, f);
+      if (fwrite(&header, sizeof(header), 1, f) != 1) {
+        fprintf(stderr, "\nCannot write navmesh header: %s\n",
+                partPath.c_str());
+        fclose(f);
+        dtFreeNavMesh(navMesh);
+        dtFreeTileCache(tileCache);
+        return 1;
+      }
     }
 
     for (size_t t = 0; t < parts[p].count; t++) {
@@ -2443,11 +2663,33 @@ int main(int argc, char *argv[]) {
       NavMeshTileHeader tileHdr{};
       tileHdr.tileRef = cnm->getTileRef(tile);
       tileHdr.dataSize = tile->dataSize;
-      fwrite(&tileHdr, sizeof(tileHdr), 1, f);
-      fwrite(tile->data, tile->dataSize, 1, f);
+      if (fwrite(&tileHdr, sizeof(tileHdr), 1, f) != 1 ||
+          fwrite(tile->data, (size_t)tile->dataSize, 1, f) != 1) {
+        fprintf(stderr, "\nCannot write navmesh tile: %s\n",
+                partPath.c_str());
+        fclose(f);
+        dtFreeNavMesh(navMesh);
+        dtFreeTileCache(tileCache);
+        return 1;
+      }
+      serializedNavMeshTiles++;
     }
-    fclose(f);
+    if (!flushSyncClose(f, partPath, "navmesh part")) {
+      dtFreeNavMesh(navMesh);
+      dtFreeTileCache(tileCache);
+      return 1;
+    }
     printf(" done\n");
+  }
+
+  if (serializedNavMeshTiles != tiles.size()) {
+    fprintf(stderr,
+            "\n[ERROR] navmesh serialization count mismatch "
+            "(serializable=%zu serialized=%zu).\n",
+            tiles.size(), serializedNavMeshTiles);
+    dtFreeNavMesh(navMesh);
+    dtFreeTileCache(tileCache);
+    return 1;
   }
 
   printf("Wrote %zu navmesh part(s) (%.2fs)\n", parts.size(), elapsed(tSave));
@@ -2536,9 +2778,7 @@ int main(int argc, char *argv[]) {
       }
       serializedCacheLayers++;
     }
-    if (fclose(f) != 0) {
-      fprintf(stderr, "\nCannot finalize TileCache part: %s\n",
-              partPath.c_str());
+    if (!flushSyncClose(f, partPath, "TileCache part")) {
       dtFreeNavMesh(navMesh);
       dtFreeTileCache(tileCache);
       return 1;
@@ -2563,6 +2803,24 @@ int main(int argc, char *argv[]) {
          "serialized=%zu\n",
          generatedCacheLayers, insertedCacheLayers, cacheTiles.size(),
          serializedCacheLayers);
+
+  std::vector<SemanticReportArtifact> reportArtifacts;
+  reportArtifacts.reserve(parts.size() + cacheParts.size());
+  for (size_t p = 0; p < parts.size(); ++p) {
+    reportArtifacts.push_back(
+        {"navmesh", outDir / ("z1_" + std::to_string(p) + ".bin")});
+  }
+  for (size_t p = 0; p < cacheParts.size(); ++p) {
+    reportArtifacts.push_back(
+        {"tilecache",
+         outDir / ("z1_cache_" + std::to_string(p) + ".bin")});
+  }
+  if (!writeSemanticReport(inputPath, options.semanticReportPath, mesh,
+                           bakedSemanticsVerified, reportArtifacts)) {
+    dtFreeNavMesh(navMesh);
+    dtFreeTileCache(tileCache);
+    return 1;
+  }
   printf("Total time: %s\n", fmtDuration(elapsed(tTotal)).c_str());
 
   dtFreeNavMesh(navMesh);

@@ -225,6 +225,14 @@ if(BUILD_TESTING)
             -P ${CMAKE_SOURCE_DIR}/tests/verify_path_independent_report.cmake
     )
 
+    add_test(NAME semantic-report-publication
+        COMMAND ${CMAKE_COMMAND}
+            -DBUILDER=$<TARGET_FILE:navmesh-builder>
+            -DSOURCE_DIR=${CMAKE_SOURCE_DIR}
+            -DOUTPUT_DIR=${CMAKE_BINARY_DIR}/semantic-report-publication
+            -P ${CMAKE_SOURCE_DIR}/tests/verify_semantic_report_publication.cmake
+    )
+
     add_test(NAME global-bounds-overlay-contract
         COMMAND ${CMAKE_COMMAND}
             -DBUILDER=$<TARGET_FILE:navmesh-builder>
