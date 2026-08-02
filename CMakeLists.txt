@@ -202,6 +202,14 @@ if(BUILD_TESTING)
             -DOUTPUT_DIR=${CMAKE_BINARY_DIR}/global-bounds-overlay
             -P ${CMAKE_SOURCE_DIR}/tests/verify_global_bounds_overlay.cmake
     )
+
+    add_test(NAME tilecache-completeness-fail-closed
+        COMMAND ${CMAKE_COMMAND}
+            -DBUILDER=$<TARGET_FILE:navmesh-builder>
+            -DSOURCE_DIR=${CMAKE_SOURCE_DIR}
+            -DOUTPUT_DIR=${CMAKE_BINARY_DIR}/tilecache-completeness
+            -P ${CMAKE_SOURCE_DIR}/tests/verify_tilecache_completeness.cmake
+    )
 endif()
 
 find_package(OpenMP)

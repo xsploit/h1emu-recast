@@ -2232,20 +2232,79 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
+  const size_t generatedCacheLayers = (size_t)totalCacheLayers;
+  size_t insertedCacheLayers = 0;
+  bool cacheInsertionFailed = false;
   for (std::vector<PendingTileCacheLayer> &layers : pendingCacheLayers) {
     for (PendingTileCacheLayer &layer : layers) {
       const dtStatus addStatus = tileCache->addTile(
           layer.data, layer.dataSize, DT_COMPRESSEDTILE_FREE_DATA, nullptr);
       if (dtStatusFailed(addStatus)) {
         fprintf(stderr,
-                "\n[WARN]  tileCache->addTile failed (tx=%d ty=%d layer=%d) "
-                "— maxTiles=%d may be too low\n",
-                layer.tx, layer.ty, layer.layer, tcParams.maxTiles);
+                "\n[ERROR] tileCache->addTile failed "
+                "(tx=%d ty=%d layer=%d status=0x%08x); refusing to write a "
+                "partial cache (generated=%zu inserted=%zu maxTiles=%d).\n",
+                layer.tx, layer.ty, layer.layer, (unsigned int)addStatus,
+                generatedCacheLayers, insertedCacheLayers,
+                tcParams.maxTiles);
         dtFree(layer.data);
+        layer.data = nullptr;
+        cacheInsertionFailed = true;
+        break;
       }
       // addTile owns successful data; a failed add was freed above.
       layer.data = nullptr;
+      insertedCacheLayers++;
     }
+    if (cacheInsertionFailed)
+      break;
+  }
+
+  if (cacheInsertionFailed) {
+    // Successful insertions are owned by tileCache. Free every layer that was
+    // not attempted after the first failure before tearing the cache down.
+    for (std::vector<PendingTileCacheLayer> &layers : pendingCacheLayers) {
+      for (PendingTileCacheLayer &layer : layers) {
+        if (layer.data) {
+          dtFree(layer.data);
+          layer.data = nullptr;
+        }
+      }
+    }
+    dtFreeNavMesh(navMesh);
+    dtFreeTileCache(tileCache);
+    return 1;
+  }
+
+  if (insertedCacheLayers != generatedCacheLayers) {
+    fprintf(stderr,
+            "\n[ERROR] TileCache insertion count mismatch; refusing to write "
+            "artifacts (generated=%zu inserted=%zu).\n",
+            generatedCacheLayers, insertedCacheLayers);
+    dtFreeNavMesh(navMesh);
+    dtFreeTileCache(tileCache);
+    return 1;
+  }
+
+  // Establish the exact serialization set before any output file is opened.
+  // A missing header/data slot here means insertion silently lost a generated
+  // layer even if every addTile call reported success.
+  std::vector<const dtCompressedTile *> cacheTiles;
+  for (int i = 0; i < tileCache->getTileCount(); ++i) {
+    const dtCompressedTile *tile = tileCache->getTile(i);
+    if (!tile || !tile->header || !tile->dataSize)
+      continue;
+    cacheTiles.push_back(tile);
+  }
+  if (cacheTiles.size() != generatedCacheLayers) {
+    fprintf(stderr,
+            "\n[ERROR] TileCache serializable layer count mismatch; refusing "
+            "to write artifacts (generated=%zu inserted=%zu "
+            "serializable=%zu).\n",
+            generatedCacheLayers, insertedCacheLayers, cacheTiles.size());
+    dtFreeNavMesh(navMesh);
+    dtFreeTileCache(tileCache);
+    return 1;
   }
 
   if (options.verifyBakedSemantics) {
@@ -2394,14 +2453,6 @@ int main(int argc, char *argv[]) {
   printf("Wrote %zu navmesh part(s) (%.2fs)\n", parts.size(), elapsed(tSave));
 
   // split into 25 MB parts
-  std::vector<const dtCompressedTile *> cacheTiles;
-  for (int i = 0; i < tileCache->getTileCount(); ++i) {
-    const dtCompressedTile *tile = tileCache->getTile(i);
-    if (!tile || !tile->header || !tile->dataSize)
-      continue;
-    cacheTiles.push_back(tile);
-  }
-
   std::vector<PartRange> cacheParts;
   {
     size_t idx = 0;
@@ -2426,6 +2477,7 @@ int main(int argc, char *argv[]) {
   }
 
   TimePoint tCacheSave = Clock::now();
+  size_t serializedCacheLayers = 0;
   for (size_t p = 0; p < cacheParts.size(); p++) {
     const std::string partPath =
         (outDir / ("z1_cache_" + std::to_string(p) + ".bin")).string();
@@ -2458,7 +2510,14 @@ int main(int argc, char *argv[]) {
       memcpy(&header.meshParams, &tcMeshParams, sizeof(dtNavMeshParams));
       memcpy(&header.cacheParams, tileCache->getParams(),
              sizeof(dtTileCacheParams));
-      fwrite(&header, sizeof(header), 1, f);
+      if (fwrite(&header, sizeof(header), 1, f) != 1) {
+        fprintf(stderr, "\nCannot write TileCache header: %s\n",
+                partPath.c_str());
+        fclose(f);
+        dtFreeNavMesh(navMesh);
+        dtFreeTileCache(tileCache);
+        return 1;
+      }
     }
 
     for (size_t t = 0; t < cacheParts[p].count; t++) {
@@ -2466,15 +2525,44 @@ int main(int argc, char *argv[]) {
       TileCacheTileHeader tileHdr{};
       tileHdr.tileRef = tileCache->getTileRef(tile);
       tileHdr.dataSize = tile->dataSize;
-      fwrite(&tileHdr, sizeof(tileHdr), 1, f);
-      fwrite(tile->data, tile->dataSize, 1, f);
+      if (fwrite(&tileHdr, sizeof(tileHdr), 1, f) != 1 ||
+          fwrite(tile->data, (size_t)tile->dataSize, 1, f) != 1) {
+        fprintf(stderr, "\nCannot write TileCache layer: %s\n",
+                partPath.c_str());
+        fclose(f);
+        dtFreeNavMesh(navMesh);
+        dtFreeTileCache(tileCache);
+        return 1;
+      }
+      serializedCacheLayers++;
     }
-    fclose(f);
+    if (fclose(f) != 0) {
+      fprintf(stderr, "\nCannot finalize TileCache part: %s\n",
+              partPath.c_str());
+      dtFreeNavMesh(navMesh);
+      dtFreeTileCache(tileCache);
+      return 1;
+    }
     printf(" done\n");
+  }
+
+  if (serializedCacheLayers != generatedCacheLayers) {
+    fprintf(stderr,
+            "\n[ERROR] TileCache serialization count mismatch "
+            "(generated=%zu inserted=%zu serializable=%zu serialized=%zu).\n",
+            generatedCacheLayers, insertedCacheLayers, cacheTiles.size(),
+            serializedCacheLayers);
+    dtFreeNavMesh(navMesh);
+    dtFreeTileCache(tileCache);
+    return 1;
   }
 
   printf("Wrote %zu cache part(s) (%.2fs)\n", cacheParts.size(),
          elapsed(tCacheSave));
+  printf("Cache completeness: generated=%zu inserted=%zu serializable=%zu "
+         "serialized=%zu\n",
+         generatedCacheLayers, insertedCacheLayers, cacheTiles.size(),
+         serializedCacheLayers);
   printf("Total time: %s\n", fmtDuration(elapsed(tTotal)).c_str());
 
   dtFreeNavMesh(navMesh);
