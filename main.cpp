@@ -2477,6 +2477,17 @@ int main(int argc, char *argv[]) {
   std::vector<std::vector<PendingTileCacheLayer>> pendingCacheLayers(
       (size_t)totalTiles);
 
+  // Direct navmesh tiles need the same treatment: dtNavMesh::addTile assigns
+  // tile slots and refs in insertion order, and serialization later walks
+  // getTile(i) slot order and embeds getTileRef values, so inserting from
+  // inside the parallel loop (completion order) made multithreaded direct
+  // output nondeterministic even though every per-tile blob was identical.
+  struct PendingNavTile {
+    unsigned char *data = nullptr;
+    int dataSize = 0;
+  };
+  std::vector<PendingNavTile> pendingNavTiles((size_t)totalTiles);
+
   std::mutex navMeshMutex; // guards writes and progress counters
   int processed = 0;
 
@@ -2523,24 +2534,15 @@ int main(int argc, char *argv[]) {
                 return left.layer < right.layer;
               });
 
+    pendingNavTiles[(size_t)i] = {data, dataSize};
+
     {
       std::lock_guard<std::mutex> lock(navMeshMutex);
       if (!data) {
         emptyTiles++;
       } else {
-        navMesh->removeTile(navMesh->getTileRefAt(tx, ty, 0), nullptr, nullptr);
-        dtTileRef ref = 0;
-        if (dtStatusFailed(
-                navMesh->addTile(data, dataSize, DT_TILE_FREE_DATA, 0, &ref))) {
-          dtFree(data);
-          emptyTiles++;
-        } else {
-          builtTiles++;
-          totalNavBytes += dataSize;
-          const dtMeshTile *tile = navMesh->getTileByRef(ref);
-          if (tile && tile->header)
-            totalPolys += tile->header->polyCount;
-        }
+        builtTiles++;
+        totalNavBytes += dataSize;
       }
       int layersThisTile = (int)pending.size();
       if (tileCtx.hadError || cacheCtx.hadError)
@@ -2551,6 +2553,31 @@ int main(int argc, char *argv[]) {
       processed++;
       printProgress(processed, totalTiles, builtTiles, totalNavBytes,
                     elapsed(tBuild));
+    }
+  }
+
+  // Insert direct tiles sequentially in canonical tileList order, mirroring
+  // the deferred TileCache insertion below. This is what makes tile refs and
+  // serialized bytes independent of OpenMP completion order.
+  for (int i = 0; i < totalTiles; ++i) {
+    PendingNavTile &pendingTile = pendingNavTiles[(size_t)i];
+    if (!pendingTile.data)
+      continue;
+    const auto [tx, ty] = tileList[(size_t)i];
+    navMesh->removeTile(navMesh->getTileRefAt(tx, ty, 0), nullptr, nullptr);
+    dtTileRef ref = 0;
+    if (dtStatusFailed(navMesh->addTile(pendingTile.data,
+                                        pendingTile.dataSize,
+                                        DT_TILE_FREE_DATA, 0, &ref))) {
+      dtFree(pendingTile.data);
+      pendingTile.data = nullptr;
+      builtTiles--;
+      totalNavBytes -= pendingTile.dataSize;
+      emptyTiles++;
+    } else {
+      const dtMeshTile *tile = navMesh->getTileByRef(ref);
+      if (tile && tile->header)
+        totalPolys += tile->header->polyCount;
     }
   }
 

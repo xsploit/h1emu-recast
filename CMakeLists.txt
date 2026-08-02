@@ -282,6 +282,14 @@ if(BUILD_TESTING)
             -DOUTPUT_DIR=${CMAKE_BINARY_DIR}/geometry-source-determinism
             -P ${CMAKE_SOURCE_DIR}/tests/verify_geometry_source_determinism.cmake
     )
+
+    add_test(NAME parallel-build-determinism
+        COMMAND ${CMAKE_COMMAND}
+            -DBUILDER=$<TARGET_FILE:navmesh-builder>
+            -DSOURCE_DIR=${CMAKE_SOURCE_DIR}
+            -DOUTPUT_DIR=${CMAKE_BINARY_DIR}/parallel-build-determinism
+            -P ${CMAKE_SOURCE_DIR}/tests/verify_parallel_determinism.cmake
+    )
 endif()
 
 find_package(OpenMP)
