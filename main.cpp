@@ -1231,6 +1231,104 @@ struct ObstacleProbe {
   float x, y, z;
 };
 
+struct PointXZ {
+  float x, z;
+};
+
+static std::vector<PointXZ>
+clipPolygonToAxis(const std::vector<PointXZ> &input, int axis, float boundary,
+                  bool keepGreater) {
+  std::vector<PointXZ> output;
+  if (input.empty())
+    return output;
+  const auto coordinate = [axis](const PointXZ &point) {
+    return axis == 0 ? point.x : point.z;
+  };
+  const auto inside = [&](const PointXZ &point) {
+    return keepGreater ? coordinate(point) >= boundary
+                       : coordinate(point) <= boundary;
+  };
+  PointXZ previous = input.back();
+  bool previousInside = inside(previous);
+  for (const PointXZ &current : input) {
+    const bool currentInside = inside(current);
+    if (previousInside != currentInside) {
+      const float previousCoordinate = coordinate(previous);
+      const float delta = coordinate(current) - previousCoordinate;
+      if (fabsf(delta) > 1e-8f) {
+        const float t = (boundary - previousCoordinate) / delta;
+        output.push_back({previous.x + (current.x - previous.x) * t,
+                          previous.z + (current.z - previous.z) * t});
+      }
+    }
+    if (currentInside)
+      output.push_back(current);
+    previous = current;
+    previousInside = currentInside;
+  }
+  return output;
+}
+
+static bool triangleOverlapsBoundsXZ(const float *a, const float *b,
+                                     const float *c,
+                                     const BuildBounds &bounds) {
+  if (!bounds.enabled)
+    return true;
+  std::vector<PointXZ> clipped = {
+      {a[0], a[2]}, {b[0], b[2]}, {c[0], c[2]}};
+  clipped = clipPolygonToAxis(clipped, 0, bounds.minX, true);
+  clipped = clipPolygonToAxis(clipped, 0, bounds.maxX, false);
+  clipped = clipPolygonToAxis(clipped, 1, bounds.minZ, true);
+  clipped = clipPolygonToAxis(clipped, 1, bounds.maxZ, false);
+  if (clipped.size() < 3)
+    return false;
+  double twiceArea = 0.0;
+  for (size_t i = 0; i < clipped.size(); ++i) {
+    const PointXZ &from = clipped[i];
+    const PointXZ &to = clipped[(i + 1) % clipped.size()];
+    twiceArea += (double)from.x * to.z - (double)to.x * from.z;
+  }
+  // Boundary-only contact does not put rasterizable source area inside the
+  // requested region and therefore cannot create a retained polygon there.
+  return fabs(twiceArea) > 1e-8;
+}
+
+static bool triangleCouldBeWalkable(const float *a, const float *b,
+                                    const float *c) {
+  const float ab[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]};
+  const float ac[3] = {c[0] - a[0], c[1] - a[1], c[2] - a[2]};
+  const float normal[3] = {ab[1] * ac[2] - ab[2] * ac[1],
+                           ab[2] * ac[0] - ab[0] * ac[2],
+                           ab[0] * ac[1] - ab[1] * ac[0]};
+  const float length = sqrtf(rcSqr(normal[0]) + rcSqr(normal[1]) +
+                             rcSqr(normal[2]));
+  if (length <= 1e-8f)
+    return false;
+  constexpr float PI = 3.14159265358979323846f;
+  const float walkableThreshold = cosf(AGENT_MAX_SLOPE / 180.0f * PI);
+  return normal[1] / length > walkableThreshold;
+}
+
+static std::map<unsigned int, long long>
+collectRequiredSemanticAreas(const Mesh &mesh, const BuildBounds &bounds) {
+  std::map<unsigned int, long long> required;
+  for (size_t tri = 0; tri < mesh.triangleSemantics.size(); ++tri) {
+    if (mesh.nonWalkableTris[tri])
+      continue;
+    const SemanticSpec *spec = semanticSpec(mesh.triangleSemantics[tri]);
+    if (!spec || spec->area == RC_NULL_AREA)
+      continue;
+    const float *a = &mesh.verts[mesh.tris[tri * 3 + 0] * 3];
+    const float *b = &mesh.verts[mesh.tris[tri * 3 + 1] * 3];
+    const float *c = &mesh.verts[mesh.tris[tri * 3 + 2] * 3];
+    if (!triangleCouldBeWalkable(a, b, c) ||
+        !triangleOverlapsBoundsXZ(a, b, c, bounds))
+      continue;
+    required[spec->area]++;
+  }
+  return required;
+}
+
 static std::vector<ObstacleProbe> collectObstacleProbes(const Mesh &mesh) {
   std::vector<ObstacleProbe> probes;
   for (size_t tri = 0; tri < mesh.triangleSemantics.size(); ++tri) {
@@ -1272,7 +1370,9 @@ static bool pointInPolyXZ(const float x, const float z, const dtMeshTile &tile,
 }
 
 static bool inspectBakedSemantics(const char *label, const dtNavMesh &navMesh,
-                                  const Mesh &mesh) {
+                                  const Mesh &mesh,
+                                  const std::map<unsigned int, long long>
+                                      &requiredSemanticAreas) {
   std::map<unsigned int, long long> areas;
   long long polygons = 0;
   for (int tileIndex = 0; tileIndex < navMesh.getMaxTiles(); ++tileIndex) {
@@ -1296,15 +1396,20 @@ static bool inspectBakedSemantics(const char *label, const dtNavMesh &navMesh,
       polygons++;
     }
   }
-  for (const SemanticSpec &spec : SEMANTIC_SPECS) {
-    if (spec.area == RC_NULL_AREA ||
-        !mesh.semanticHistogram.count(spec.material))
-      continue;
-    if (!areas.count(spec.area)) {
+  for (const auto &[area, sourceTriangles] : requiredSemanticAreas) {
+    if (!areas.count(area)) {
+      const SemanticSpec *requiredSpec = nullptr;
+      for (const SemanticSpec &spec : SEMANTIC_SPECS)
+        if (spec.area == area) {
+          requiredSpec = &spec;
+          break;
+        }
       fprintf(stderr,
               "%s semantic inspection failed: no polygon retained area %u "
-              "(%s)\n",
-              label, spec.area, spec.material);
+              "(%s, %lld in-bounds walkable source triangle(s))\n",
+              label, area,
+              requiredSpec ? requiredSpec->material : "unknown-semantic-area",
+              sourceTriangles);
       return false;
     }
   }
@@ -1797,7 +1902,16 @@ int main(int argc, char *argv[]) {
   }
 
   if (options.verifyBakedSemantics) {
-    if (!inspectBakedSemantics("direct", *navMesh, mesh)) {
+    const std::map<unsigned int, long long> requiredSemanticAreas =
+        collectRequiredSemanticAreas(mesh, options.bounds);
+    printf("Semantic verification source coverage:");
+    if (requiredSemanticAreas.empty())
+      printf(" none");
+    for (const auto &[area, triangles] : requiredSemanticAreas)
+      printf(" area%u=%lld", area, triangles);
+    printf(" (%s)\n", options.bounds.enabled ? "requested bounds" : "full mesh");
+    if (!inspectBakedSemantics("direct", *navMesh, mesh,
+                               requiredSemanticAreas)) {
       dtFreeNavMesh(navMesh);
       dtFreeTileCache(tileCache);
       return 1;
@@ -1820,8 +1934,9 @@ int main(int argc, char *argv[]) {
         break;
       }
     }
-    if (!cacheBuildOk ||
-        !inspectBakedSemantics("tilecache", *cacheNavMesh, mesh)) {
+    if (!cacheBuildOk || !inspectBakedSemantics(
+                             "tilecache", *cacheNavMesh, mesh,
+                             requiredSemanticAreas)) {
       dtFreeNavMesh(cacheNavMesh);
       dtFreeNavMesh(navMesh);
       dtFreeTileCache(tileCache);

@@ -77,5 +77,10 @@ never records the caller-spelled input path. Use `--semantic-report <path>` to
 choose another path.
 `--validate-semantics-only --require-all-semantics` validates a fixture without
 building any tiles. `--verify-baked-semantics` additionally inspects direct and
-materialized TileCache polygons after a bounded bake, including static-obstacle
-footprint probes.
+materialized TileCache polygons after a bake, including static-obstacle
+footprint probes. With `--bounds`, retained area IDs are required only for
+canonical source triangles that have non-zero X/Z overlap with the requested
+bounds and pass the configured Recast slope test. Materials found only in the
+rest of a source chunk cannot make a regional verification fail; in-bounds
+walkable source coverage still must survive in both outputs with the canonical
+flags.

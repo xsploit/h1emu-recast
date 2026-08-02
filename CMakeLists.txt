@@ -120,6 +120,14 @@ if(BUILD_TESTING)
             --semantic-report ${CMAKE_BINARY_DIR}/semantic-bake/semantics.json
     )
 
+    add_test(NAME semantic-bounded-source-coverage
+        COMMAND ${CMAKE_COMMAND}
+            -DBUILDER=$<TARGET_FILE:navmesh-builder>
+            -DSOURCE_DIR=${CMAKE_SOURCE_DIR}
+            -DOUTPUT_DIR=${CMAKE_BINARY_DIR}/semantic-bounded-coverage
+            -P ${CMAKE_SOURCE_DIR}/tests/verify_bounded_semantic_coverage.cmake
+    )
+
     add_test(NAME semantic-report-path-independent
         COMMAND ${CMAKE_COMMAND}
             -DBUILDER=$<TARGET_FILE:navmesh-builder>
