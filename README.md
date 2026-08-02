@@ -21,7 +21,8 @@ cmake --build build-msvc --parallel
 ## Run
 
 ```sh
-./build/navmesh-builder ./world-semantic.obj ./out/navmesh.bin --profile human
+./build/navmesh-builder ./world-semantic.obj ./out/navmesh.bin --profile human \
+  --dynamic-door-obstacles
 ```
 
 The builder takes the path to a world `.obj` file and outputs the generated
@@ -59,12 +60,22 @@ Flag values are `WALK=0x01`, `INDOOR=0x02`, `TRANSITION=0x04`, and
 `DOOR=0x08`. Unknown `nav_*` materials are fatal. Untagged faces and ordinary
 materials are fatal in semantic input, preventing silent taxonomy drift.
 
+`nav_door_panel_dynamic` intentionally removes the baked door panel so the
+server can own the closed/open blocker through TileCache. A strict semantic
+bake containing this material fails unless `--dynamic-door-obstacles` is
+present. The acknowledgement is recorded in semantic provenance and must be
+paired with deployment that enables and validates runtime door obstacles.
+
 Pre-semantic OBJ files are supported only with the explicit
 `--legacy-object-fallback` option. This enables the historical object-name
 rules without allowing them to override canonical semantic faces.
 
 Every run writes `<output>.semantics.json` with the semantic contract,
-deterministic material histogram, taxonomy, warnings, input size/hash, and
-legacy-mode state. Use `--semantic-report <path>` to choose another path.
+deterministic material histogram, taxonomy, warnings, normalized input basename
+and content identity, dynamic-door acknowledgement, and legacy-mode state. It
+never records the caller-spelled input path. Use `--semantic-report <path>` to
+choose another path.
 `--validate-semantics-only --require-all-semantics` validates a fixture without
-building any tiles.
+building any tiles. `--verify-baked-semantics` additionally inspects direct and
+materialized TileCache polygons after a bounded bake, including static-obstacle
+footprint probes.

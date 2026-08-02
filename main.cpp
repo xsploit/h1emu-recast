@@ -203,7 +203,9 @@ struct BuildBounds {
 struct BuildOptions {
   BuildBounds bounds;
   bool legacyObjectFallback = false;
+  bool dynamicDoorObstacles = false;
   bool validateSemanticsOnly = false;
+  bool verifyBakedSemantics = false;
   bool requireAllSemantics = false;
   std::string semanticReportPath;
 };
@@ -399,6 +401,7 @@ struct Mesh {
   long long ordinaryMaterialTriangles = 0;
   bool semanticInput = false;
   bool legacyObjectFallback = false;
+  bool dynamicDoorObstaclesAcknowledged = false;
   float bmin[3];
   float bmax[3];
 };
@@ -410,7 +413,8 @@ static std::string lowerObjectName(const std::string &name) {
   return lower;
 }
 
-static bool loadObj(const char *path, Mesh &out, bool legacyObjectFallback) {
+static bool loadObj(const char *path, Mesh &out, bool legacyObjectFallback,
+                    bool dynamicDoorObstacles) {
   printf("Loading %s ...\n", path);
   TimePoint t0 = Clock::now();
 
@@ -423,6 +427,7 @@ static bool loadObj(const char *path, Mesh &out, bool legacyObjectFallback) {
   out.bmin[0] = out.bmin[1] = out.bmin[2] = 1e30f;
   out.bmax[0] = out.bmax[1] = out.bmax[2] = -1e30f;
   out.legacyObjectFallback = legacyObjectFallback;
+  out.dynamicDoorObstaclesAcknowledged = dynamicDoorObstacles;
 
   char line[4096];
   std::string objectName;
@@ -619,6 +624,14 @@ static bool loadObj(const char *path, Mesh &out, bool legacyObjectFallback) {
             out.fallbackTriangles);
     return false;
   }
+  if (out.semanticHistogram.count("nav_door_panel_dynamic") &&
+      !dynamicDoorObstacles) {
+    fprintf(stderr,
+            "  Semantic OBJ excludes nav_door_panel_dynamic geometry; pass "
+            "--dynamic-door-obstacles to acknowledge that runtime door "
+            "obstacles are required\n");
+    return false;
+  }
 
   if (out.verts.empty() || out.tris.empty()) {
     fprintf(stderr, "  No geometry found in %s\n", path);
@@ -707,16 +720,22 @@ static bool writeSemanticReport(const char *inputPath, const std::string &path,
   }
   std::error_code sizeError;
   const auto inputBytes = std::filesystem::file_size(inputPath, sizeError);
+  const std::string inputName =
+      std::filesystem::path(inputPath).lexically_normal().filename().string();
+  const std::string inputHash = fnv1a64File(inputPath);
   report << "{\n"
          << "  \"schemaVersion\": 1,\n"
          << "  \"semanticContract\": \"" << SEMANTIC_CONTRACT << "\",\n"
-         << "  \"inputPath\": \"" << jsonEscape(inputPath) << "\",\n"
+         << "  \"inputName\": \"" << jsonEscape(inputName) << "\",\n"
          << "  \"inputBytes\": " << (sizeError ? 0 : inputBytes) << ",\n"
-         << "  \"inputFnv1a64\": \"" << fnv1a64File(inputPath) << "\",\n"
+         << "  \"inputIdentity\": \"fnv1a64:" << inputHash << "\",\n"
          << "  \"semanticInput\": " << (mesh.semanticInput ? "true" : "false")
          << ",\n"
          << "  \"legacyObjectFallback\": "
          << (mesh.legacyObjectFallback ? "true" : "false") << ",\n"
+         << "  \"dynamicDoorObstaclesAcknowledged\": "
+         << (mesh.dynamicDoorObstaclesAcknowledged ? "true" : "false")
+         << ",\n"
          << "  \"sourceTriangles\": " << mesh.sourceTriangles << ",\n"
          << "  \"keptTriangles\": " << mesh.triangleSemantics.size() << ",\n"
          << "  \"excludedTriangles\": " << mesh.excludedSemanticTriangles
@@ -832,6 +851,50 @@ static RasterTriangles prepareRasterTriangles(rcContext *ctx, const Mesh &mesh,
   return raster;
 }
 
+static void applyNonWalkableCarves(rcContext *ctx, const Mesh &mesh,
+                                   const std::vector<int> &triIds,
+                                   const rcConfig &cfg,
+                                   rcCompactHeightfield &chf) {
+  for (const NonWalkableVolume &volume : mesh.nonWalkableVolumes) {
+    if (volume.bmax[0] < cfg.bmin[0] || volume.bmin[0] > cfg.bmax[0] ||
+        volume.bmax[2] < cfg.bmin[2] || volume.bmin[2] > cfg.bmax[2])
+      continue;
+    rcMarkBoxArea(ctx, volume.bmin, volume.bmax, RC_NULL_AREA, chf);
+  }
+
+  // rcFilterLowHangingWalkableObstacles can promote a shallow null span back
+  // to the walkable area beneath it. Re-apply semantic obstacle bounds after
+  // compact-heightfield filtering so roofs, bottoms, and walls remain carved.
+  // Bounds are per source triangle, avoiding object-wide boxes that would erase
+  // legitimate floors inside mixed-semantics structure meshes.
+  for (int triId : triIds) {
+    const SemanticSpec *spec = semanticSpec(mesh.triangleSemantics[triId]);
+    if (!spec || !spec->rasterizeNull)
+      continue;
+    float bmin[3] = {1e30f, 1e30f, 1e30f};
+    float bmax[3] = {-1e30f, -1e30f, -1e30f};
+    for (int corner = 0; corner < 3; ++corner) {
+      const float *vertex =
+          &mesh.verts[mesh.tris[triId * 3 + corner] * 3];
+      for (int axis = 0; axis < 3; ++axis) {
+        bmin[axis] = std::min(bmin[axis], vertex[axis]);
+        bmax[axis] = std::max(bmax[axis], vertex[axis]);
+      }
+    }
+    const float horizontalPad = cfg.cs * 0.5f;
+    bmin[0] -= horizontalPad;
+    bmin[2] -= horizontalPad;
+    bmax[0] += horizontalPad;
+    bmax[2] += horizontalPad;
+    bmin[1] -= cfg.ch * 2.0f;
+    bmax[1] += cfg.ch * 2.0f;
+    if (bmax[0] < cfg.bmin[0] || bmin[0] > cfg.bmax[0] ||
+        bmax[2] < cfg.bmin[2] || bmin[2] > cfg.bmax[2])
+      continue;
+    rcMarkBoxArea(ctx, bmin, bmax, RC_NULL_AREA, chf);
+  }
+}
+
 static bool validateSemanticRasterMapping(const Mesh &mesh) {
   std::vector<int> triIds(mesh.triangleSemantics.size());
   for (size_t i = 0; i < triIds.size(); ++i)
@@ -945,12 +1008,7 @@ static unsigned char *buildTile(rcContext *ctx, const Mesh &mesh,
   }
   rcFreeHeightField(hf);
 
-  for (const NonWalkableVolume &volume : mesh.nonWalkableVolumes) {
-    if (volume.bmax[0] < cfg.bmin[0] || volume.bmin[0] > cfg.bmax[0] ||
-        volume.bmax[2] < cfg.bmin[2] || volume.bmin[2] > cfg.bmax[2])
-      continue;
-    rcMarkBoxArea(ctx, volume.bmin, volume.bmax, RC_NULL_AREA, *chf);
-  }
+  applyNonWalkableCarves(ctx, mesh, triIds, cfg, *chf);
 
   if (!rcErodeWalkableArea(ctx, cfg.walkableRadius, *chf)) {
     rcFreeCompactHeightfield(chf);
@@ -1119,12 +1177,7 @@ buildTileCacheLayers(rcContext *ctx, const Mesh &mesh, const TriGrid &grid,
   }
   rcFreeHeightField(hf);
 
-  for (const NonWalkableVolume &volume : mesh.nonWalkableVolumes) {
-    if (volume.bmax[0] < cfg.bmin[0] || volume.bmin[0] > cfg.bmax[0] ||
-        volume.bmax[2] < cfg.bmin[2] || volume.bmin[2] > cfg.bmax[2])
-      continue;
-    rcMarkBoxArea(ctx, volume.bmin, volume.bmax, RC_NULL_AREA, *chf);
-  }
+  applyNonWalkableCarves(ctx, mesh, triIds, cfg, *chf);
 
   if (!rcErodeWalkableArea(ctx, cfg.walkableRadius, *chf)) {
     rcFreeCompactHeightfield(chf);
@@ -1174,6 +1227,129 @@ buildTileCacheLayers(rcContext *ctx, const Mesh &mesh, const TriGrid &grid,
   return result;
 }
 
+struct ObstacleProbe {
+  float x, y, z;
+};
+
+static std::vector<ObstacleProbe> collectObstacleProbes(const Mesh &mesh) {
+  std::vector<ObstacleProbe> probes;
+  for (size_t tri = 0; tri < mesh.triangleSemantics.size(); ++tri) {
+    if (mesh.triangleSemantics[tri] != NavSemantic::ObstacleStatic)
+      continue;
+    const float *a = &mesh.verts[mesh.tris[tri * 3 + 0] * 3];
+    const float *b = &mesh.verts[mesh.tris[tri * 3 + 1] * 3];
+    const float *c = &mesh.verts[mesh.tris[tri * 3 + 2] * 3];
+    const float ab[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]};
+    const float ac[3] = {c[0] - a[0], c[1] - a[1], c[2] - a[2]};
+    const float normalY = ab[2] * ac[0] - ab[0] * ac[2];
+    const float normalLength =
+        sqrtf(rcSqr(ab[1] * ac[2] - ab[2] * ac[1]) + rcSqr(normalY) +
+              rcSqr(ab[0] * ac[1] - ab[1] * ac[0]));
+    if (normalLength <= 1e-5f || fabsf(normalY) / normalLength < 0.75f)
+      continue; // probes target horizontal blocker footprint faces
+    probes.push_back({(a[0] + b[0] + c[0]) / 3.0f,
+                      (a[1] + b[1] + c[1]) / 3.0f,
+                      (a[2] + b[2] + c[2]) / 3.0f});
+  }
+  return probes;
+}
+
+static bool pointInPolyXZ(const float x, const float z, const dtMeshTile &tile,
+                          const dtPoly &poly) {
+  bool hasPositive = false;
+  bool hasNegative = false;
+  for (int edge = 0; edge < poly.vertCount; ++edge) {
+    const float *a = &tile.verts[poly.verts[edge] * 3];
+    const float *b = &tile.verts[poly.verts[(edge + 1) % poly.vertCount] * 3];
+    const float cross = (b[0] - a[0]) * (z - a[2]) -
+                        (b[2] - a[2]) * (x - a[0]);
+    hasPositive = hasPositive || cross > 1e-4f;
+    hasNegative = hasNegative || cross < -1e-4f;
+    if (hasPositive && hasNegative)
+      return false;
+  }
+  return true;
+}
+
+static bool inspectBakedSemantics(const char *label, const dtNavMesh &navMesh,
+                                  const Mesh &mesh) {
+  std::map<unsigned int, long long> areas;
+  long long polygons = 0;
+  for (int tileIndex = 0; tileIndex < navMesh.getMaxTiles(); ++tileIndex) {
+    const dtMeshTile *tile = navMesh.getTile(tileIndex);
+    if (!tile || !tile->header)
+      continue;
+    for (int polyIndex = 0; polyIndex < tile->header->polyCount; ++polyIndex) {
+      const dtPoly &poly = tile->polys[polyIndex];
+      if (poly.getType() != DT_POLYTYPE_GROUND)
+        continue;
+      const unsigned char area = poly.getArea();
+      const unsigned short expectedFlags = flagsForArea(area);
+      if (expectedFlags == 0 || poly.flags != expectedFlags) {
+        fprintf(stderr,
+                "%s semantic inspection failed: unexpected area=%u flags=%u "
+                "expected=%u\n",
+                label, area, poly.flags, expectedFlags);
+        return false;
+      }
+      areas[area]++;
+      polygons++;
+    }
+  }
+  for (const SemanticSpec &spec : SEMANTIC_SPECS) {
+    if (spec.area == RC_NULL_AREA ||
+        !mesh.semanticHistogram.count(spec.material))
+      continue;
+    if (!areas.count(spec.area)) {
+      fprintf(stderr,
+              "%s semantic inspection failed: no polygon retained area %u "
+              "(%s)\n",
+              label, spec.area, spec.material);
+      return false;
+    }
+  }
+
+  const std::vector<ObstacleProbe> probes = collectObstacleProbes(mesh);
+  if (mesh.semanticHistogram.count("nav_obstacle_static") && probes.empty()) {
+    fprintf(stderr,
+            "%s semantic inspection failed: obstacle fixture has no horizontal "
+            "footprint probes\n",
+            label);
+    return false;
+  }
+  for (const ObstacleProbe &probe : probes) {
+    for (int tileIndex = 0; tileIndex < navMesh.getMaxTiles(); ++tileIndex) {
+      const dtMeshTile *tile = navMesh.getTile(tileIndex);
+      if (!tile || !tile->header)
+        continue;
+      for (int polyIndex = 0; polyIndex < tile->header->polyCount;
+           ++polyIndex) {
+        const dtPoly &poly = tile->polys[polyIndex];
+        if (poly.getType() != DT_POLYTYPE_GROUND ||
+            !pointInPolyXZ(probe.x, probe.z, *tile, poly))
+          continue;
+        float averageY = 0.0f;
+        for (int vertex = 0; vertex < poly.vertCount; ++vertex)
+          averageY += tile->verts[poly.verts[vertex] * 3 + 1];
+        averageY /= poly.vertCount;
+        if (fabsf(averageY - probe.y) <= AGENT_HEIGHT) {
+          fprintf(stderr,
+                  "%s semantic inspection failed: walkable area %u covers "
+                  "nav_obstacle_static probe (%.2f, %.2f, %.2f)\n",
+                  label, poly.getArea(), probe.x, probe.y, probe.z);
+          return false;
+        }
+      }
+    }
+  }
+
+  printf("%s semantic polygons: total=%lld", label, polygons);
+  for (const auto &[area, count] : areas)
+    printf(" area%u=%lld", area, count);
+  printf(" obstacleProbes=%zu PASS\n", probes.size());
+  return true;
+}
+
 static void printUsage(const char *program) {
   fprintf(stderr,
           "Usage: %s <input.obj> [output.bin] [options]\n"
@@ -1192,8 +1368,10 @@ static void printUsage(const char *program) {
           "  --bounds <minX> <minZ> <maxX> <maxZ>\n"
           "                              Build only intersecting global tiles\n"
           "  --legacy-object-fallback   Enable pre-semantic object-name rules\n"
+          "  --dynamic-door-obstacles  Acknowledge required runtime door blockers\n"
           "  --semantic-report <path>  Write deterministic semantic provenance\n"
           "  --validate-semantics-only Parse/report semantics without baking\n"
+          "  --verify-baked-semantics  Inspect direct and TileCache polygons\n"
           "  --require-all-semantics    Require every canonical tag (fixtures)\n"
           "\n"
           "The human profile uses cs=.2, ch=.1, radius=.2, climb=1.3,\n"
@@ -1271,8 +1449,16 @@ static bool parseOptions(int argc, char *argv[], int start,
       options.legacyObjectFallback = true;
       continue;
     }
+    if (strcmp(arg, "--dynamic-door-obstacles") == 0) {
+      options.dynamicDoorObstacles = true;
+      continue;
+    }
     if (strcmp(arg, "--validate-semantics-only") == 0) {
       options.validateSemanticsOnly = true;
+      continue;
+    }
+    if (strcmp(arg, "--verify-baked-semantics") == 0) {
+      options.verifyBakedSemantics = true;
       continue;
     }
     if (strcmp(arg, "--require-all-semantics") == 0) {
@@ -1371,7 +1557,8 @@ int main(int argc, char *argv[]) {
   TimePoint tTotal = Clock::now();
 
   Mesh mesh;
-  if (!loadObj(inputPath, mesh, options.legacyObjectFallback))
+  if (!loadObj(inputPath, mesh, options.legacyObjectFallback,
+               options.dynamicDoorObstacles))
     return 1;
   if (options.semanticReportPath.empty())
     options.semanticReportPath = outputPath + ".semantics.json";
@@ -1607,6 +1794,40 @@ int main(int argc, char *argv[]) {
     dtFreeNavMesh(navMesh);
     dtFreeTileCache(tileCache);
     return 1;
+  }
+
+  if (options.verifyBakedSemantics) {
+    if (!inspectBakedSemantics("direct", *navMesh, mesh)) {
+      dtFreeNavMesh(navMesh);
+      dtFreeTileCache(tileCache);
+      return 1;
+    }
+    dtNavMesh *cacheNavMesh = dtAllocNavMesh();
+    if (!cacheNavMesh || dtStatusFailed(cacheNavMesh->init(&nmParams))) {
+      fprintf(stderr, "Cannot initialize TileCache semantic inspection mesh\n");
+      dtFreeNavMesh(cacheNavMesh);
+      dtFreeNavMesh(navMesh);
+      dtFreeTileCache(tileCache);
+      return 1;
+    }
+    bool cacheBuildOk = true;
+    for (const auto &[tx, ty] : tileList) {
+      if (dtStatusFailed(tileCache->buildNavMeshTilesAt(tx, ty, cacheNavMesh))) {
+        fprintf(stderr,
+                "TileCache semantic inspection failed to materialize (%d,%d)\n",
+                tx, ty);
+        cacheBuildOk = false;
+        break;
+      }
+    }
+    if (!cacheBuildOk ||
+        !inspectBakedSemantics("tilecache", *cacheNavMesh, mesh)) {
+      dtFreeNavMesh(cacheNavMesh);
+      dtFreeNavMesh(navMesh);
+      dtFreeTileCache(tileCache);
+      return 1;
+    }
+    dtFreeNavMesh(cacheNavMesh);
   }
 
   // split into 25 MB parts
