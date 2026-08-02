@@ -21,6 +21,7 @@
 #include "DetourCommon.h"
 #include "DetourNavMesh.h"
 #include "DetourNavMeshBuilder.h"
+#include "DetourNavMeshQuery.h"
 #include "DetourTileCache.h"
 #include "DetourTileCacheBuilder.h"
 #include "Recast.h"
@@ -1581,25 +1582,27 @@ static std::vector<ObstacleProbe> collectObstacleProbes(const Mesh &mesh) {
 
 static bool pointInPolyXZ(const float x, const float z, const dtMeshTile &tile,
                           const dtPoly &poly) {
-  bool hasPositive = false;
-  bool hasNegative = false;
-  for (int edge = 0; edge < poly.vertCount; ++edge) {
-    const float *a = &tile.verts[poly.verts[edge] * 3];
-    const float *b = &tile.verts[poly.verts[(edge + 1) % poly.vertCount] * 3];
-    const float cross = (b[0] - a[0]) * (z - a[2]) -
-                        (b[2] - a[2]) * (x - a[0]);
-    hasPositive = hasPositive || cross > 1e-4f;
-    hasNegative = hasNegative || cross < -1e-4f;
-    if (hasPositive && hasNegative)
-      return false;
-  }
-  return true;
+  float vertices[DT_VERTS_PER_POLYGON * 3];
+  for (int vertex = 0; vertex < poly.vertCount; ++vertex)
+    dtVcopy(&vertices[vertex * 3], &tile.verts[poly.verts[vertex] * 3]);
+  const float position[3] = {x, 0.0f, z};
+  // Use Detour's own containment predicate so a successful containment test
+  // guarantees that getPolyHeight can sample this polygon at the same X/Z.
+  return dtPointInPolygon(position, vertices, poly.vertCount);
 }
 
 static bool inspectBakedSemantics(const char *label, const dtNavMesh &navMesh,
                                   const Mesh &mesh,
                                   const std::map<unsigned int, long long>
                                       &requiredSemanticAreas) {
+  dtNavMeshQuery navQuery;
+  if (dtStatusFailed(navQuery.init(&navMesh, 64))) {
+    fprintf(stderr,
+            "%s semantic inspection failed: could not initialize height "
+            "query\n",
+            label);
+    return false;
+  }
   std::map<unsigned int, long long> areas;
   long long polygons = 0;
   for (int tileIndex = 0; tileIndex < navMesh.getMaxTiles(); ++tileIndex) {
@@ -1660,10 +1663,18 @@ static bool inspectBakedSemantics(const char *label, const dtNavMesh &navMesh,
         if (poly.getType() != DT_POLYTYPE_GROUND ||
             !pointInPolyXZ(probe.x, probe.z, *tile, poly))
           continue;
-        float averageY = 0.0f;
-        for (int vertex = 0; vertex < poly.vertCount; ++vertex)
-          averageY += tile->verts[poly.verts[vertex] * 3 + 1];
-        averageY /= poly.vertCount;
+        const float probePosition[3] = {probe.x, probe.y, probe.z};
+        float polygonY = 0.0f;
+        const dtPolyRef polyRef =
+            navMesh.getPolyRefBase(tile) | (dtPolyRef)polyIndex;
+        if (dtStatusFailed(
+                navQuery.getPolyHeight(polyRef, probePosition, &polygonY))) {
+          fprintf(stderr,
+                  "%s semantic inspection failed: could not sample walkable "
+                  "area %u at nav_obstacle_static probe (%.2f, %.2f, %.2f)\n",
+                  label, poly.getArea(), probe.x, probe.y, probe.z);
+          return false;
+        }
         // An obstacle surface invalidates a walkable span at the same height,
         // or below it without enough agent headroom. A polygon on a distinct
         // floor above the obstacle is valid multi-storey topology and must not
@@ -1672,14 +1683,14 @@ static bool inspectBakedSemantics(const char *label, const dtNavMesh &navMesh,
         const float verticalQuantizationTolerance =
             std::max(CELL_HEIGHT * 2.0f,
                      CELL_HEIGHT * DETAIL_SAMPLE_MAX_ERR);
-        const float clearanceAboveWalkable = probe.y - averageY;
+        const float clearanceAboveWalkable = probe.y - polygonY;
         if (clearanceAboveWalkable >= -verticalQuantizationTolerance &&
             clearanceAboveWalkable <= AGENT_HEIGHT) {
           fprintf(stderr,
                   "%s semantic inspection failed: walkable area %u covers "
                   "nav_obstacle_static probe (%.2f, %.2f, %.2f; "
                   "polygonY=%.2f clearance=%.2f)\n",
-                  label, poly.getArea(), probe.x, probe.y, probe.z, averageY,
+                  label, poly.getArea(), probe.x, probe.y, probe.z, polygonY,
                   clearanceAboveWalkable);
           return false;
         }

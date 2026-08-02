@@ -154,6 +154,19 @@ if(BUILD_TESTING)
             --semantic-report ${CMAKE_BINARY_DIR}/semantic-slanted-obstacle/semantics.json
     )
 
+    add_test(NAME semantic-buried-obstacle-on-slope
+        COMMAND navmesh-builder
+            ${CMAKE_SOURCE_DIR}/tests/semantic_buried_obstacle_on_slope.obj
+            ${CMAKE_BINARY_DIR}/semantic-buried-obstacle-on-slope/output.bin
+            --profile human
+            --agent-climb 0.5
+            --region-min 1
+            --region-merge 1
+            --dynamic-door-obstacles
+            --verify-baked-semantics
+            --semantic-report ${CMAKE_BINARY_DIR}/semantic-buried-obstacle-on-slope/semantics.json
+    )
+
     add_test(NAME semantic-small-threshold-retained
         COMMAND navmesh-builder
             ${CMAKE_SOURCE_DIR}/tests/semantic_small_threshold.obj
