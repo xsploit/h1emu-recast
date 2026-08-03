@@ -303,6 +303,22 @@ protected:
   void doLog(const rcLogCategory category, const char *msg,
              const int /*len*/) override {
     if (category == RC_LOG_ERROR) {
+      // Recast reports this contour condition as RC_LOG_ERROR but deliberately
+      // continues and returns a usable contour set.  Treating every logged
+      // error as a failed tile caused otherwise complete world bakes to be
+      // discarded.  Keep the diagnostic visible, while reserving hadError for
+      // failures that Recast actually cannot recover from.
+      constexpr const char *kRecoverableMultipleOutlines =
+          "rcBuildContours: Multiple outlines for region ";
+      if (std::strncmp(msg, kRecoverableMultipleOutlines,
+                       std::strlen(kRecoverableMultipleOutlines)) == 0) {
+        if (tileX >= 0)
+          fprintf(stderr, "\n[WARN]  tile=(%d,%d) %s (Recast continued)\n",
+                  tileX, tileY, msg);
+        else
+          fprintf(stderr, "\n[WARN]  %s (Recast continued)\n", msg);
+        return;
+      }
       hadError = true;
       if (tileX >= 0)
         fprintf(stderr, "\n[ERROR] tile=(%d,%d) %s\n", tileX, tileY, msg);
