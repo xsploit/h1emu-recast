@@ -42,6 +42,7 @@
 #include "nav_semantic.h"
 #include "navigation_transitions.h"
 #include "tile_raster_input.h"
+#include "triangle_geometry.h"
 
 struct TriGrid {
   std::vector<std::vector<int>> cells;
@@ -1129,24 +1130,6 @@ static bool triangleOverlapsCellXZ(const float *a, const float *b,
     if (separatedOnAxis(-(to[2] - from[2]), to[0] - from[0]))
       return false;
   }
-  return true;
-}
-
-static bool trianglePlaneHeightXZ(const float *a, const float *b,
-                                  const float *c, float x, float z,
-                                  float &height) {
-  const float denominator =
-      (b[2] - c[2]) * (a[0] - c[0]) +
-      (c[0] - b[0]) * (a[2] - c[2]);
-  if (fabsf(denominator) <= 1e-8f)
-    return false;
-  const float wa = ((b[2] - c[2]) * (x - c[0]) +
-                    (c[0] - b[0]) * (z - c[2])) /
-                   denominator;
-  const float wb = ((c[2] - a[2]) * (x - c[0]) +
-                    (a[0] - c[0]) * (z - c[2])) /
-                   denominator;
-  height = wa * a[1] + wb * b[1] + (1.0f - wa - wb) * c[1];
   return true;
 }
 

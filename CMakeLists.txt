@@ -36,6 +36,7 @@ target_link_libraries(forgelight-nav-source-inspect PRIVATE
 
 add_executable(navmesh-builder
     main.cpp
+    triangle_geometry.cpp
     ${RECAST_SOURCES}
     ${DETOUR_SOURCES}
     ${DETOUR_TILECACHE_SOURCES}
@@ -88,6 +89,20 @@ else()
 endif()
 
 if(BUILD_TESTING)
+    add_executable(triangle-geometry-test
+        tests/triangle_geometry_test.cpp
+        triangle_geometry.cpp)
+    target_include_directories(triangle-geometry-test PRIVATE
+        ${CMAKE_SOURCE_DIR})
+    if(MSVC)
+        target_compile_options(triangle-geometry-test PRIVATE /W4 /O2)
+    else()
+        target_compile_options(triangle-geometry-test PRIVATE
+            -Wall -Wextra -Wpedantic)
+    endif()
+    add_test(NAME triangle-geometry-contract
+        COMMAND triangle-geometry-test)
+
     add_executable(forgelight-nav-source-test
         tests/forgelight_nav_source_test.cpp)
     target_link_libraries(forgelight-nav-source-test PRIVATE
