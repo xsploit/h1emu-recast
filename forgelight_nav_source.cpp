@@ -223,7 +223,11 @@ bool isCompatible(CollisionKind kind, SemanticId semantic,
   case CollisionKind::Solid:
     return semantic == SemanticId::ObstacleStatic;
   case CollisionKind::Thin:
-    return semantic == SemanticId::ObstacleStatic ||
+    // Extraction uses kind Thin for two reviewed city-road slab assets. The
+    // H1SEM1 policy is exact actor/hash bound and slope-verified, so ROAD is a
+    // safe authored exception; unclassified kind-2 geometry remains UNKNOWN.
+    return semantic == SemanticId::Road ||
+           semantic == SemanticId::ObstacleStatic ||
            semantic == SemanticId::Exclude;
   case CollisionKind::Door:
     return semantic == SemanticId::DoorPanelDynamic;

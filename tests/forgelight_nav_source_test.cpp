@@ -203,6 +203,9 @@ int main() {
                 semantics.semantics[1] == SemanticId::ObstacleStatic,
             "H1SEM1 decode mismatch");
     validateH1Sem1Compatibility(collision, semantics, true);
+    H1Col2Document reviewedThinRoad = collision;
+    reviewedThinRoad.meshes[0].kind = CollisionKind::Thin;
+    validateH1Sem1Compatibility(reviewedThinRoad, semantics, true);
     H1Sem1Document unsafeKind = semantics;
     unsafeKind.semantics[1] = SemanticId::Exclude;
     expectFailure("solid H1COL2 kind with exclude semantic", [&] {
