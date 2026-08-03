@@ -27,11 +27,16 @@ int appendThresholdPortalPads(TileRasterInput &mesh, float extension) {
                                       edgeLengths, edgeLengths + 3) -
                                   edgeLengths);
     const float shortLength = edgeLengths[shortEdge];
-    const float longLength =
-        *std::max_element(edgeLengths, edgeLengths + 3);
-    // A threshold portal must have a clear narrow travel axis. Refuse to
-    // synthesize geometry for degenerate or roughly square authored surfaces.
-    if (shortLength <= 1e-4f || longLength <= shortLength * 2.0f)
+    float orderedLengths[3] = {edgeLengths[0], edgeLengths[1], edgeLengths[2]};
+    std::sort(orderedLengths, orderedLengths + 3);
+    const float middleLength = orderedLengths[1];
+    // The longest edge of a rectangular source triangle is its diagonal, so
+    // comparing diagonal/short rejects legitimate modest-aspect portals (the
+    // SmallHouse02A doorway is about 0.85m x 1.27m). Compare the two rectangle
+    // axes instead: require one edge to be at least 20% narrower, while still
+    // refusing degenerate and genuinely square surfaces with no safe travel
+    // direction.
+    if (shortLength <= 1e-4f || middleLength <= shortLength * 1.2f)
       continue;
 
     const int axisFrom = sourceIndices[shortEdge];

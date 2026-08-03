@@ -67,6 +67,24 @@ int main() {
     return 1;
   }
 
+  // A real SmallHouse02A doorway step is directional but not 2:1: its
+  // rectangle is approximately 0.85m x 1.27m.  The diagonal of either source
+  // triangle is only 1.8x the short edge, so a diagonal/short heuristic used
+  // to reject it and made connectivity depend on voxel-grid rotation.
+  TileRasterInput modestRectangle;
+  modestRectangle.verts = {0.0f, 0.0f, 0.0f, 0.85f, 0.0f, 0.0f,
+                           0.0f, 0.0f, 1.27f, 0.85f, 0.0f, 1.27f};
+  modestRectangle.tris = {0, 1, 2, 2, 1, 3};
+  modestRectangle.nonWalkableTris = {0, 0};
+  modestRectangle.triangleSemantics = {NavSemantic::Threshold,
+                                       NavSemantic::Threshold};
+  modestRectangle.triangleObjects = {8, 8};
+  if (appendThresholdPortalPads(modestRectangle, 0.4f) != 2) {
+    std::fprintf(stderr,
+                 "directional modest-aspect threshold surface was rejected\n");
+    return 1;
+  }
+
   TileRasterInput ordinary = square;
   ordinary.triangleSemantics = {NavSemantic::FloorInterior};
   if (appendThresholdPortalPads(ordinary, 0.4f) != 0 ||
