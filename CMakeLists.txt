@@ -36,6 +36,7 @@ target_link_libraries(forgelight-nav-source-inspect PRIVATE
 
 add_executable(navmesh-builder
     main.cpp
+    threshold_portal_geometry.cpp
     triangle_geometry.cpp
     ${RECAST_SOURCES}
     ${DETOUR_SOURCES}
@@ -89,6 +90,21 @@ else()
 endif()
 
 if(BUILD_TESTING)
+    add_executable(threshold-portal-geometry-test
+        tests/threshold_portal_geometry_test.cpp
+        threshold_portal_geometry.cpp)
+    target_include_directories(threshold-portal-geometry-test PRIVATE
+        ${CMAKE_SOURCE_DIR}
+        ${RECAST_DIR}/Recast/Include)
+    if(MSVC)
+        target_compile_options(threshold-portal-geometry-test PRIVATE /W4 /O2)
+    else()
+        target_compile_options(threshold-portal-geometry-test PRIVATE
+            -Wall -Wextra -Wpedantic)
+    endif()
+    add_test(NAME threshold-portal-geometry-contract
+        COMMAND threshold-portal-geometry-test)
+
     add_executable(triangle-geometry-test
         tests/triangle_geometry_test.cpp
         triangle_geometry.cpp)

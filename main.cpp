@@ -42,6 +42,7 @@
 #include "nav_semantic.h"
 #include "navigation_transitions.h"
 #include "tile_raster_input.h"
+#include "threshold_portal_geometry.h"
 #include "triangle_geometry.h"
 
 struct TriGrid {
@@ -1363,6 +1364,10 @@ static unsigned char *buildTile(rcContext *ctx, const GeometrySource &source,
     rcFreeHeightField(hf);
     return nullptr;
   }
+  // Preserve authored threshold connectivity through radius erosion plus one
+  // voxel of arbitrary grid-phase slack on each side of the sill.
+  appendThresholdPortalPads(tileInput,
+                            cfg.cs * (float)(cfg.walkableRadius + 1));
   std::vector<int> triIds(tileInput.tris.size() / 3);
   std::iota(triIds.begin(), triIds.end(), 0);
 
@@ -1555,6 +1560,10 @@ buildTileCacheLayers(rcContext *ctx, const GeometrySource &source,
     rcFreeHeightField(hf);
     return result;
   }
+  // Preserve authored threshold connectivity through radius erosion plus one
+  // voxel of arbitrary grid-phase slack on each side of the sill.
+  appendThresholdPortalPads(tileInput,
+                            cfg.cs * (float)(cfg.walkableRadius + 1));
   std::vector<int> triIds(tileInput.tris.size() / 3);
   std::iota(triIds.begin(), triIds.end(), 0);
 
