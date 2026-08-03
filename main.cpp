@@ -2760,6 +2760,46 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
+  // Regional ForgeLight bakes are the proof surface for authored model rules.
+  // A compressed layer can serialize successfully yet fail later when the
+  // server asks DetourTileCache to reconstruct its navmesh column.  Exercise
+  // that exact reconstruction path before accepting a regional artifact so a
+  // direct-nav success cannot conceal an unusable streamed cache.
+  if (options.geometrySource == GeometrySourceKind::Forgelight &&
+      options.bounds.enabled) {
+    dtNavMesh *cacheValidationMesh = dtAllocNavMesh();
+    if (!cacheValidationMesh ||
+        dtStatusFailed(cacheValidationMesh->init(&nmParams))) {
+      fprintf(stderr,
+              "Cannot initialize regional TileCache validation mesh\n");
+      dtFreeNavMesh(cacheValidationMesh);
+      dtFreeNavMesh(navMesh);
+      dtFreeTileCache(tileCache);
+      return 1;
+    }
+    bool cacheBuildOk = true;
+    for (const auto &[tx, ty] : tileList) {
+      const dtStatus buildStatus =
+          tileCache->buildNavMeshTilesAt(tx, ty, cacheValidationMesh);
+      if (dtStatusFailed(buildStatus)) {
+        fprintf(stderr,
+                "Regional TileCache validation failed to materialize "
+                "(%d,%d), status=0x%08x\n",
+                tx, ty, (unsigned int)buildStatus);
+        cacheBuildOk = false;
+        break;
+      }
+    }
+    dtFreeNavMesh(cacheValidationMesh);
+    if (!cacheBuildOk) {
+      dtFreeNavMesh(navMesh);
+      dtFreeTileCache(tileCache);
+      return 1;
+    }
+    printf("Regional TileCache materialization PASS (%zu layer%s)\n",
+           generatedCacheLayers, generatedCacheLayers == 1 ? "" : "s");
+  }
+
   bool bakedSemanticsVerified = false;
   if (options.verifyBakedSemantics) {
     const std::map<unsigned int, long long> requiredSemanticAreas =
