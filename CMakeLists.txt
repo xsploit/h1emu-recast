@@ -54,11 +54,19 @@ target_include_directories(navmesh-builder PRIVATE
     ${RECAST_DIR}/RecastDemo/Contrib/fastlz
 )
 
-add_executable(tilecache-overlay tilecache_overlay.cpp)
+add_executable(tilecache-overlay
+    tilecache_overlay.cpp
+    ${DETOUR_SOURCES}
+    ${DETOUR_TILECACHE_SOURCES}
+    ${RECAST_DIR}/RecastDemo/Contrib/fastlz/fastlz.c)
+
+target_link_libraries(tilecache-overlay PRIVATE forgelight-nav-source)
 
 target_include_directories(tilecache-overlay PRIVATE
+    ${RECAST_DIR}/Recast/Include
     ${RECAST_DIR}/Detour/Include
     ${RECAST_DIR}/DetourTileCache/Include
+    ${RECAST_DIR}/RecastDemo/Contrib/fastlz
 )
 
 target_compile_definitions(navmesh-builder PRIVATE
@@ -74,7 +82,9 @@ if(MSVC)
     target_compile_options(forgelight-nav-source-inspect PRIVATE /W4 /O2)
     target_compile_options(navmesh-builder PRIVATE /W4 /O2 /fp:fast)
     target_compile_definitions(navmesh-builder PRIVATE _CRT_SECURE_NO_WARNINGS)
-    target_compile_options(tilecache-overlay PRIVATE /W4 /O2)
+    # The histogram reconstructs TileCache polygons and must use the same
+    # floating-point semantics as the baker it is auditing.
+    target_compile_options(tilecache-overlay PRIVATE /W4 /O2 /fp:fast)
     target_compile_definitions(tilecache-overlay PRIVATE _CRT_SECURE_NO_WARNINGS)
 else()
     target_compile_options(forgelight-nav-source PRIVATE
@@ -86,7 +96,11 @@ else()
         -march=native
         -ffast-math
     )
-    target_compile_options(tilecache-overlay PRIVATE -Wall -Wextra)
+    target_compile_options(tilecache-overlay PRIVATE
+        -Wall -Wextra
+        -march=native
+        -ffast-math
+    )
 endif()
 
 if(BUILD_TESTING)
@@ -162,6 +176,14 @@ if(BUILD_TESTING)
 
     add_test(NAME tilecache-overlay-self-test
         COMMAND tilecache-overlay --self-test)
+
+    add_test(NAME tilecache-polycount-histogram
+        COMMAND ${CMAKE_COMMAND}
+            -DBUILDER=$<TARGET_FILE:navmesh-builder>
+            -DOVERLAY=$<TARGET_FILE:tilecache-overlay>
+            -DSOURCE_DIR=${CMAKE_SOURCE_DIR}
+            -DOUTPUT_DIR=${CMAKE_BINARY_DIR}/tilecache-polycount
+            -P ${CMAKE_SOURCE_DIR}/tests/verify_polycount_histogram.cmake)
 
     add_test(NAME semantic-contract
         COMMAND navmesh-builder
@@ -318,6 +340,14 @@ if(BUILD_TESTING)
             -DSOURCE_DIR=${CMAKE_SOURCE_DIR}
             -DOUTPUT_DIR=${CMAKE_BINARY_DIR}/tilecache-completeness
             -P ${CMAKE_SOURCE_DIR}/tests/verify_tilecache_completeness.cmake
+    )
+
+    add_test(NAME direct-nav-completeness-fail-closed
+        COMMAND ${CMAKE_COMMAND}
+            -DBUILDER=$<TARGET_FILE:navmesh-builder>
+            -DSOURCE_DIR=${CMAKE_SOURCE_DIR}
+            -DOUTPUT_DIR=${CMAKE_BINARY_DIR}/direct-nav-completeness
+            -P ${CMAKE_SOURCE_DIR}/tests/verify_direct_nav_completeness.cmake
     )
 
     add_test(NAME geometry-source-determinism

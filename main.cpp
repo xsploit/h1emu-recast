@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cctype>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -134,6 +135,8 @@ struct BuildOptions {
   bool dynamicDoorObstacles = false;
   bool validateSemanticsOnly = false;
   bool verifyBakedSemantics = false;
+  bool allowPartialNavmesh = false;
+  int directNavTileBits = -1;
   bool requireAllSemantics = false;
   std::string semanticReportPath;
   GeometrySourceKind geometrySource = GeometrySourceKind::Obj;
@@ -1986,6 +1989,9 @@ static void printUsage(const char *program) {
           "  --semantic-report <path>  Write deterministic semantic provenance\n"
           "  --validate-semantics-only Parse/report semantics without baking\n"
           "  --verify-baked-semantics  Inspect direct and TileCache polygons\n"
+          "  --direct-nav-tile-bits <bits>\n"
+          "                              Override the 32-bit direct tile/poly split\n"
+          "  --allow-partial-navmesh  Diagnostic only: serialize after direct rejection\n"
           "  --require-all-semantics    Require every canonical tag (fixtures)\n"
           "  --geometry-source obj|forgelight\n"
           "                              Select the tile geometry source (default obj)\n"
@@ -2017,6 +2023,15 @@ static bool parseFloat(const char *text, float &value) {
   char *end = nullptr;
   value = strtof(text, &end);
   return end != text && *end == '\0' && std::isfinite(value);
+}
+
+static bool parseInteger(const char *text, int &value) {
+  char *end = nullptr;
+  const long parsed = strtol(text, &end, 10);
+  if (end == text || *end != '\0' || parsed < INT_MIN || parsed > INT_MAX)
+    return false;
+  value = (int)parsed;
+  return true;
 }
 
 static bool applyProfile(const char *name) {
@@ -2108,6 +2123,18 @@ static bool parseOptions(int argc, char *argv[], int start,
     }
     if (strcmp(arg, "--verify-baked-semantics") == 0) {
       options.verifyBakedSemantics = true;
+      continue;
+    }
+    if (strcmp(arg, "--allow-partial-navmesh") == 0) {
+      options.allowPartialNavmesh = true;
+      continue;
+    }
+    if (strcmp(arg, "--direct-nav-tile-bits") == 0) {
+      if (++i >= argc || !parseInteger(argv[i], options.directNavTileBits) ||
+          options.directNavTileBits < 0 || options.directNavTileBits > 21) {
+        fprintf(stderr, "Invalid value for --direct-nav-tile-bits (0..21)\n");
+        return false;
+      }
       continue;
     }
     if (strcmp(arg, "--require-all-semantics") == 0) {
@@ -2440,8 +2467,11 @@ int main(int argc, char *argv[]) {
   // for compatibility with a larger full-world cache.
   const long long capacityTileCount =
       options.globalBounds.enabled ? fullTileCount : totalTiles;
-  const int tileBits = rcMin(
+  const int automaticTileBits = rcMin(
       (int)ilog2(nextPow2((unsigned int)capacityTileCount)), 14);
+  const int tileBits = options.directNavTileBits >= 0
+                           ? options.directNavTileBits
+                           : automaticTileBits;
   const int maxTiles = 1 << tileBits;
   const int maxPolysPerTile = 1 << (22 - tileBits);
 
@@ -2449,8 +2479,9 @@ int main(int argc, char *argv[]) {
          "  (%.2f wu/tile)\n",
          tw, th, firstTx, lastTx, firstTy, lastTy, totalTiles,
          tileWorldSize);
-  printf("Tile bits : %d  →  maxTiles=%d  maxPolys/tile=%d\n", tileBits,
-         maxTiles, maxPolysPerTile);
+  printf("Tile bits : %d%s  →  maxTiles=%d  maxPolys/tile=%d\n", tileBits,
+         options.directNavTileBits >= 0 ? " (explicit)" : "", maxTiles,
+         maxPolysPerTile);
   printf("Voxel     : cs=%.3f  ch=%.3f\n", CELL_SIZE, CELL_HEIGHT);
   printf("Agent     : height=%.2f  radius=%.2f  climb=%.2f  slope=%.1f°\n",
          AGENT_HEIGHT, AGENT_RADIUS, AGENT_MAX_CLIMB, AGENT_MAX_SLOPE);
@@ -2523,10 +2554,16 @@ int main(int argc, char *argv[]) {
 #else
   printf("Building navmesh (single-threaded)...\n");
 #endif
-  int builtTiles = 0;
+  int generatedNavTiles = 0;
+  int admittedNavTiles = 0;
+  int rejectedNavTiles = 0;
   int emptyTiles = 0;
-  long long totalNavBytes = 0;
-  int totalPolys = 0;
+  long long generatedNavBytes = 0;
+  long long admittedNavBytes = 0;
+  int admittedPolys = 0;
+  std::vector<int> directPolyCounts;
+  std::map<int, int> directPolyHistogram;
+  std::map<unsigned int, int> directRejectionStatuses;
   int totalCacheLayers = 0;
   int maxLayersPerTile = 0;
   int failedRecastTiles = 0;
@@ -2616,8 +2653,8 @@ int main(int argc, char *argv[]) {
       if (!data) {
         emptyTiles++;
       } else {
-        builtTiles++;
-        totalNavBytes += dataSize;
+        generatedNavTiles++;
+        generatedNavBytes += dataSize;
       }
       int layersThisTile = (int)pending.size();
       if (tileCtx.hadError || cacheCtx.hadError)
@@ -2626,7 +2663,8 @@ int main(int argc, char *argv[]) {
       if (layersThisTile > maxLayersPerTile)
         maxLayersPerTile = layersThisTile;
       processed++;
-      printProgress(processed, totalTiles, builtTiles, totalNavBytes,
+      printProgress(processed, totalTiles, generatedNavTiles,
+                    generatedNavBytes,
                     elapsed(tBuild));
     }
   }
@@ -2639,20 +2677,35 @@ int main(int argc, char *argv[]) {
     if (!pendingTile.data)
       continue;
     const auto [tx, ty] = tileList[(size_t)i];
+    const dtMeshHeader *generatedHeader =
+        reinterpret_cast<const dtMeshHeader *>(pendingTile.data);
+    if (generatedHeader && generatedHeader->magic == DT_NAVMESH_MAGIC) {
+      directPolyCounts.push_back(generatedHeader->polyCount);
+      directPolyHistogram[generatedHeader->polyCount]++;
+    }
     navMesh->removeTile(navMesh->getTileRefAt(tx, ty, 0), nullptr, nullptr);
     dtTileRef ref = 0;
-    if (dtStatusFailed(navMesh->addTile(pendingTile.data,
-                                        pendingTile.dataSize,
-                                        DT_TILE_FREE_DATA, 0, &ref))) {
+    const dtStatus addStatus = navMesh->addTile(
+        pendingTile.data, pendingTile.dataSize, DT_TILE_FREE_DATA, 0, &ref);
+    if (dtStatusFailed(addStatus)) {
+      directRejectionStatuses[(unsigned int)addStatus]++;
+      if (rejectedNavTiles < 20) {
+        fprintf(stderr,
+                "\n[ERROR] direct navmesh addTile rejected "
+                "(tx=%d ty=%d polyCount=%d status=0x%08x maxTiles=%d "
+                "maxPolys=%d).\n",
+                tx, ty, generatedHeader ? generatedHeader->polyCount : -1,
+                (unsigned int)addStatus, maxTiles, maxPolysPerTile);
+      }
       dtFree(pendingTile.data);
       pendingTile.data = nullptr;
-      builtTiles--;
-      totalNavBytes -= pendingTile.dataSize;
-      emptyTiles++;
+      rejectedNavTiles++;
     } else {
+      admittedNavTiles++;
+      admittedNavBytes += pendingTile.dataSize;
       const dtMeshTile *tile = navMesh->getTileByRef(ref);
       if (tile && tile->header)
-        totalPolys += tile->header->polyCount;
+        admittedPolys += tile->header->polyCount;
     }
   }
 
@@ -2660,18 +2713,65 @@ int main(int argc, char *argv[]) {
   printf("\n"); // end progress bar line
 
   printf("Build done in %s\n", fmtDuration(buildSec).c_str());
-  printf("  Tiles built  : %d / %d  (%d empty/water skipped)\n", builtTiles,
-         totalTiles, emptyTiles);
-  printf("  Total polys  : %d\n", totalPolys);
-  printf("  Navmesh size : %s\n", fmtSize(totalNavBytes).c_str());
-  if (builtTiles > 0)
-    printf("  Avg/tile     : %.1f ms\n", (buildSec * 1000.0) / builtTiles);
+  printf("  Direct tiles : generated=%d admitted=%d rejected=%d empty=%d "
+         "total=%d\n",
+         generatedNavTiles, admittedNavTiles, rejectedNavTiles, emptyTiles,
+         totalTiles);
+  printf("  Admitted polys: %d\n", admittedPolys);
+  printf("  Navmesh size : admitted=%s generated=%s\n",
+         fmtSize(admittedNavBytes).c_str(), fmtSize(generatedNavBytes).c_str());
+  if (generatedNavTiles > 0)
+    printf("  Avg/generated tile: %.1f ms\n",
+           (buildSec * 1000.0) / generatedNavTiles);
+  if (!directPolyCounts.empty()) {
+    std::sort(directPolyCounts.begin(), directPolyCounts.end());
+    const auto percentile = [&](double fraction) {
+      const size_t index = (size_t)ceil(
+          fraction * (double)directPolyCounts.size());
+      return directPolyCounts[std::min(
+          std::max<size_t>(index, 1) - 1, directPolyCounts.size() - 1)];
+    };
+    printf("  Direct poly counts: p50=%d p95=%d p99=%d max=%d limit=%d\n",
+           percentile(0.50), percentile(0.95), percentile(0.99),
+           directPolyCounts.back(), maxPolysPerTile);
+    printf("  Direct poly histogram:");
+    for (const auto &[polyCount, count] : directPolyHistogram)
+      printf(" %d:%d", polyCount, count);
+    printf("\n");
+  }
   printf("  Cache layers : %d total  max/tile=%d  "
          "(EXPECTED_LAYERS_PER_TILE=%d)%s\n",
          totalCacheLayers, maxLayersPerTile, EXPECTED_LAYERS_PER_TILE,
          maxLayersPerTile > EXPECTED_LAYERS_PER_TILE
              ? "  *** LAYERS DROPPED ***"
              : "");
+  if (rejectedNavTiles > 20)
+    fprintf(stderr, "[ERROR] %d additional direct rejection(s) suppressed.\n",
+            rejectedNavTiles - 20);
+  if (rejectedNavTiles > 0) {
+    fprintf(stderr, "[ERROR] Direct rejection status histogram:");
+    for (const auto &[status, count] : directRejectionStatuses)
+      fprintf(stderr, " 0x%08x:%d", status, count);
+    fprintf(stderr, "\n");
+    if (!options.allowPartialNavmesh) {
+      fprintf(stderr,
+              "[ERROR] Refusing to write a partial direct navmesh "
+              "(generated=%d admitted=%d rejected=%d empty=%d). Use "
+              "--allow-partial-navmesh only for diagnostics.\n",
+              generatedNavTiles, admittedNavTiles, rejectedNavTiles,
+              emptyTiles);
+      for (auto &layers : pendingCacheLayers)
+        for (PendingTileCacheLayer &layer : layers)
+          dtFree(layer.data);
+      dtFreeNavMesh(navMesh);
+      dtFreeTileCache(tileCache);
+      return 1;
+    }
+    fprintf(stderr,
+            "[WARN] Diagnostic partial-navmesh override accepted "
+            "(generated=%d admitted=%d rejected=%d).\n",
+            generatedNavTiles, admittedNavTiles, rejectedNavTiles);
+  }
   if (failedRecastTiles > 0) {
     fprintf(stderr,
             "\n[ERROR] Navmesh build failed in %d tile(s); refusing to write "

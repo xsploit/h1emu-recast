@@ -11,6 +11,7 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <optional>
 #include <regex>
 #include <set>
 #include <sstream>
@@ -19,9 +20,14 @@
 #include <tuple>
 #include <vector>
 
+#include "DetourCommon.h"
 #include "DetourNavMesh.h"
+#include "DetourNavMeshBuilder.h"
 #include "DetourTileCache.h"
 #include "DetourTileCacheBuilder.h"
+#include "fastlz.h"
+#include "nav_semantic.h"
+#include "navigation_transitions.h"
 
 namespace fs = std::filesystem;
 
@@ -43,6 +49,55 @@ struct TileCacheSetHeader {
 struct TileCacheTileHeader {
   dtCompressedTileRef tileRef;
   int dataSize;
+};
+
+struct FastLZCompressor : dtTileCacheCompressor {
+  int maxCompressedSize(const int bufferSize) override {
+    return static_cast<int>(bufferSize * 1.05f) + 66;
+  }
+  dtStatus compress(const unsigned char *buffer, const int bufferSize,
+                    unsigned char *compressed, const int,
+                    int *compressedSize) override {
+    *compressedSize = fastlz_compress(buffer, bufferSize, compressed);
+    return DT_SUCCESS;
+  }
+  dtStatus decompress(const unsigned char *compressed,
+                      const int compressedSize, unsigned char *buffer,
+                      const int maxBufferSize, int *bufferSize) override {
+    *bufferSize = fastlz_decompress(compressed, compressedSize, buffer,
+                                    maxBufferSize);
+    return *bufferSize < 0 ? DT_FAILURE : DT_SUCCESS;
+  }
+};
+
+// TileCache reconstruction is designed around a resettable scratch arena.
+// Using the default malloc/free allocator for 100k layers both distorts the
+// timing measurement and exercises the Windows heap millions of times. This
+// matches RecastDemo's production TileCache allocator contract.
+struct LinearAllocator : dtTileCacheAlloc {
+  unsigned char *buffer = nullptr;
+  std::size_t capacity = 0;
+  std::size_t top = 0;
+  std::size_t high = 0;
+
+  explicit LinearAllocator(std::size_t requestedCapacity)
+      : capacity(requestedCapacity) {
+    buffer = static_cast<unsigned char *>(
+        dtAlloc(capacity, DT_ALLOC_PERM));
+  }
+  ~LinearAllocator() override { dtFree(buffer); }
+  void reset() override {
+    high = std::max(high, top);
+    top = 0;
+  }
+  void *alloc(const std::size_t size) override {
+    if (!buffer || top + size > capacity)
+      return nullptr;
+    unsigned char *memory = buffer + top;
+    top += size;
+    return memory;
+  }
+  void free(void *) override {}
 };
 
 static_assert(sizeof(TileCacheSetHeader) == 92,
@@ -430,6 +485,368 @@ LoadedSet loadSet(const fs::path &directory, const std::string &label) {
   return result;
 }
 
+struct PolycountOffender {
+  LayerKey key;
+  int polygonCount = 0;
+  float worldX = 0;
+  float worldZ = 0;
+};
+
+struct MaterializationFailure {
+  LayerKey key;
+  std::string stage;
+  dtStatus status = 0;
+  float worldX = 0;
+  float worldZ = 0;
+};
+
+struct PolycountStats {
+  std::map<int, std::size_t> histogram;
+  std::vector<int> counts;
+  std::vector<PolycountOffender> offenders;
+  std::vector<MaterializationFailure> failures;
+  std::size_t totalLayers = 0;
+  std::size_t columns = 0;
+  int maxLayersPerColumn = 0;
+  std::size_t over32 = 0;
+  std::size_t over64 = 0;
+  std::size_t over128 = 0;
+  std::size_t zeroPolygons = 0;
+  int p50 = 0;
+  int p95 = 0;
+  int p99 = 0;
+  int maximum = 0;
+  double elapsedSeconds = 0;
+};
+
+std::string statusText(dtStatus status) {
+  std::ostringstream text;
+  text << "0x" << std::hex << std::setw(8) << std::setfill('0')
+       << static_cast<unsigned int>(status);
+  return text.str();
+}
+
+struct HistogramMeshProcess : dtTileCacheMeshProcess {
+  explicit HistogramMeshProcess(
+      const std::vector<h1emu::nav::NavigationTransition> *transitions)
+      : transitions(transitions) {}
+
+  void process(dtNavMeshCreateParams *params, unsigned char *polyAreas,
+               unsigned short *polyFlags) override {
+    for (int i = 0; i < params->polyCount; ++i)
+      polyFlags[i] = flagsForArea(polyAreas[i]);
+    if (!transitions || transitions->empty())
+      return;
+    binding = h1emu::nav::buildNavigationTransitionBinding(
+        *transitions, params->bmin, params->bmax, params->walkableClimb);
+    params->offMeshConVerts =
+        binding.vertices.empty() ? nullptr : binding.vertices.data();
+    params->offMeshConRad =
+        binding.radii.empty() ? nullptr : binding.radii.data();
+    params->offMeshConDir =
+        binding.directions.empty() ? nullptr : binding.directions.data();
+    params->offMeshConAreas =
+        binding.areas.empty() ? nullptr : binding.areas.data();
+    params->offMeshConFlags =
+        binding.flags.empty() ? nullptr : binding.flags.data();
+    params->offMeshConUserID =
+        binding.userIds.empty() ? nullptr : binding.userIds.data();
+    params->offMeshConCount = static_cast<int>(binding.size());
+  }
+
+  const std::vector<h1emu::nav::NavigationTransition> *transitions;
+  h1emu::nav::NavigationTransitionBinding binding;
+};
+
+struct LayerMeasurement {
+  bool success = false;
+  int polygons = 0;
+  std::string stage;
+  dtStatus status = 0;
+};
+
+LayerMeasurement measureLayer(
+    const Record &record, const TileCacheSetHeader &setHeader,
+    LinearAllocator &allocator, FastLZCompressor &compressor,
+    HistogramMeshProcess &meshProcess) {
+  allocator.reset();
+  dtTileCacheLayer *layer = nullptr;
+  dtStatus status = dtDecompressTileCacheLayer(
+      &allocator, &compressor, record.data->data(),
+      static_cast<int>(record.data->size()), &layer);
+  if (dtStatusFailed(status))
+    return {false, 0, "decompress", status};
+  const int walkableClimbVoxels = static_cast<int>(
+      setHeader.cacheParams.walkableClimb / setHeader.cacheParams.ch);
+  status =
+      dtBuildTileCacheRegions(&allocator, *layer, walkableClimbVoxels);
+  if (dtStatusFailed(status))
+    return {false, 0, "regions", status};
+  dtTileCacheContourSet *contours =
+      dtAllocTileCacheContourSet(&allocator);
+  if (!contours)
+    return {false, 0, "contours allocation",
+            DT_FAILURE | DT_OUT_OF_MEMORY};
+  status = dtBuildTileCacheContours(
+      &allocator, *layer, walkableClimbVoxels,
+      setHeader.cacheParams.maxSimplificationError, *contours);
+  if (dtStatusFailed(status))
+    return {false, 0, "contours", status};
+  dtTileCachePolyMesh *mesh = dtAllocTileCachePolyMesh(&allocator);
+  if (!mesh)
+    return {false, 0, "polymesh allocation", DT_FAILURE | DT_OUT_OF_MEMORY};
+  status = dtBuildTileCachePolyMesh(&allocator, *contours, *mesh);
+  if (dtStatusFailed(status))
+    return {false, 0, "polymesh", status};
+  if (!mesh->npolys)
+    return {true, 0, {}, DT_SUCCESS};
+
+  dtNavMeshCreateParams params{};
+  params.verts = mesh->verts;
+  params.vertCount = mesh->nverts;
+  params.polys = mesh->polys;
+  params.polyAreas = mesh->areas;
+  params.polyFlags = mesh->flags;
+  params.polyCount = mesh->npolys;
+  params.nvp = DT_VERTS_PER_POLYGON;
+  params.walkableHeight = setHeader.cacheParams.walkableHeight;
+  params.walkableRadius = setHeader.cacheParams.walkableRadius;
+  params.walkableClimb = setHeader.cacheParams.walkableClimb;
+  params.tileX = layer->header->tx;
+  params.tileY = layer->header->ty;
+  params.tileLayer = layer->header->tlayer;
+  params.cs = setHeader.cacheParams.cs;
+  params.ch = setHeader.cacheParams.ch;
+  params.buildBvTree = false;
+  dtVcopy(params.bmin, layer->header->bmin);
+  dtVcopy(params.bmax, layer->header->bmax);
+  meshProcess.process(&params, mesh->areas, mesh->flags);
+
+  unsigned char *navData = nullptr;
+  int navDataSize = 0;
+  if (!dtCreateNavMeshData(&params, &navData, &navDataSize))
+    return {false, 0, "navmesh data", DT_FAILURE};
+  const dtMeshHeader *header =
+      reinterpret_cast<const dtMeshHeader *>(navData);
+  const int polygons = header ? header->polyCount : 0;
+  dtFree(navData);
+  return {true, polygons, {}, DT_SUCCESS};
+}
+
+void writePolycountReport(const fs::path &path, const LoadedSet &set,
+                          const PolycountStats &stats, int limit,
+                          std::size_t transitionCount) {
+  if (path.empty())
+    return;
+  if (!path.parent_path().empty())
+    fs::create_directories(path.parent_path());
+  std::ofstream report(path, std::ios::binary);
+  if (!report)
+    throw std::runtime_error("cannot write report " + path.string());
+  report << "{\n  \"schema\":\"h1emu-tilecache-polycount-v1\",\n"
+         << "  \"datasetSha256\":\"" << set.datasetSha << "\",\n"
+         << "  \"layers\":" << stats.totalLayers << ",\n"
+         << "  \"measuredLayers\":" << stats.counts.size() << ",\n"
+         << "  \"columns\":" << stats.columns << ",\n"
+         << "  \"maxLayersPerColumn\":" << stats.maxLayersPerColumn
+         << ",\n  \"transitionCount\":" << transitionCount
+         << ",\n  \"limit\":" << limit << ",\n"
+         << "  \"overLimit\":" << stats.offenders.size()
+         << ",\n  \"materializationFailures\":"
+         << stats.failures.size() << ",\n  \"over32\":" << stats.over32
+         << ",\n  \"over64\":" << stats.over64
+         << ",\n  \"over128\":" << stats.over128
+         << ",\n  \"zeroPolygons\":" << stats.zeroPolygons
+         << ",\n  \"p50\":" << stats.p50
+         << ",\n  \"p95\":" << stats.p95
+         << ",\n  \"p99\":" << stats.p99
+         << ",\n  \"maximum\":" << stats.maximum
+         << ",\n  \"elapsedSeconds\":" << std::fixed
+         << std::setprecision(6) << stats.elapsedSeconds
+         << ",\n  \"histogram\":{";
+  bool first = true;
+  for (const auto &[polygons, count] : stats.histogram) {
+    if (!first)
+      report << ',';
+    first = false;
+    report << '\"' << polygons << "\":" << count;
+  }
+  report << "},\n  \"offenders\":[";
+  for (std::size_t i = 0; i < stats.offenders.size(); ++i) {
+    if (i)
+      report << ',';
+    const PolycountOffender &offender = stats.offenders[i];
+    report << "{\"tx\":" << offender.key.tx << ",\"ty\":"
+           << offender.key.ty << ",\"layer\":" << offender.key.layer
+           << ",\"worldX\":" << offender.worldX << ",\"worldZ\":"
+           << offender.worldZ << ",\"polygons\":"
+           << offender.polygonCount << '}';
+  }
+  report << "],\n  \"failures\":[";
+  for (std::size_t i = 0; i < stats.failures.size(); ++i) {
+    if (i)
+      report << ',';
+    const MaterializationFailure &failure = stats.failures[i];
+    report << "{\"tx\":" << failure.key.tx << ",\"ty\":"
+           << failure.key.ty << ",\"layer\":" << failure.key.layer
+           << ",\"worldX\":" << failure.worldX << ",\"worldZ\":"
+           << failure.worldZ << ",\"stage\":\"" << failure.stage
+           << "\",\"status\":\"" << statusText(failure.status)
+           << "\"}";
+  }
+  report << "]\n}\n";
+  if (!report)
+    throw std::runtime_error("short write to report " + path.string());
+}
+
+bool runPolycountHistogram(
+    const LoadedSet &set,
+    const std::vector<h1emu::nav::NavigationTransition> &transitions,
+    int limit, const fs::path &reportPath, int progressEvery,
+    const std::optional<std::pair<int, int>> &columnFilter) {
+  const auto started = std::chrono::steady_clock::now();
+  PolycountStats stats;
+  stats.counts.reserve(set.records.size());
+  std::map<std::pair<int, int>, int> columnLayers;
+  for (const Record &record : set.records)
+    columnLayers[{record.key.tx, record.key.ty}]++;
+  if (columnFilter) {
+    const auto found = columnLayers.find(*columnFilter);
+    if (found == columnLayers.end())
+      throw std::runtime_error("requested histogram column is not in the set");
+    const auto selected = *found;
+    columnLayers.clear();
+    columnLayers.insert(selected);
+  }
+  stats.columns = columnLayers.size();
+  for (const auto &[column, layers] : columnLayers) {
+    (void)column;
+    stats.maxLayersPerColumn = std::max(stats.maxLayersPerColumn, layers);
+    stats.totalLayers += static_cast<std::size_t>(layers);
+  }
+
+  LinearAllocator allocator(16ULL * 1024ULL * 1024ULL);
+  FastLZCompressor compressor;
+  HistogramMeshProcess meshProcess(&transitions);
+  const float tileWidth = set.header.cacheParams.width *
+                          set.header.cacheParams.cs;
+  const float tileHeight = set.header.cacheParams.height *
+                           set.header.cacheParams.cs;
+  std::size_t processedLayers = 0;
+  for (const Record &record : set.records) {
+    if (columnFilter &&
+        std::pair<int, int>{record.key.tx, record.key.ty} != *columnFilter)
+      continue;
+    const LayerMeasurement measurement = measureLayer(
+        record, set.header, allocator, compressor, meshProcess);
+    const float worldX = set.header.cacheParams.orig[0] +
+                         (record.key.tx + 0.5f) * tileWidth;
+    const float worldZ = set.header.cacheParams.orig[2] +
+                         (record.key.ty + 0.5f) * tileHeight;
+    if (!measurement.success) {
+      stats.failures.push_back({record.key, measurement.stage,
+                                measurement.status, worldX, worldZ});
+      processedLayers++;
+      if (processedLayers % static_cast<std::size_t>(progressEvery) == 0 ||
+          processedLayers == stats.totalLayers)
+        std::cout << "\rPolycount " << processedLayers << '/'
+                  << stats.totalLayers << " layers" << std::flush;
+      continue;
+    }
+    const int polygons = measurement.polygons;
+    stats.counts.push_back(polygons);
+    stats.histogram[polygons]++;
+    if (polygons == 0)
+      stats.zeroPolygons++;
+    if (polygons > 32)
+      stats.over32++;
+    if (polygons > 64)
+      stats.over64++;
+    if (polygons > 128)
+      stats.over128++;
+    if (polygons > limit) {
+      stats.offenders.push_back({record.key, polygons, worldX, worldZ});
+    }
+    processedLayers++;
+    if (processedLayers % static_cast<std::size_t>(progressEvery) == 0 ||
+        processedLayers == stats.totalLayers)
+      std::cout << "\rPolycount " << processedLayers << '/'
+                << stats.totalLayers << " layers"
+                << std::flush;
+  }
+  std::cout << '\n';
+  stats.elapsedSeconds = std::chrono::duration<double>(
+                             std::chrono::steady_clock::now() - started)
+                             .count();
+  std::sort(stats.counts.begin(), stats.counts.end());
+  const auto percentile = [&](double fraction) {
+    const std::size_t index = static_cast<std::size_t>(
+        std::ceil(fraction * static_cast<double>(stats.counts.size())));
+    return stats.counts[std::min(std::max<std::size_t>(index, 1) - 1,
+                                 stats.counts.size() - 1)];
+  };
+  if (!stats.counts.empty()) {
+    stats.p50 = percentile(0.50);
+    stats.p95 = percentile(0.95);
+    stats.p99 = percentile(0.99);
+    stats.maximum = stats.counts.back();
+  }
+  std::cout << "Polycount summary: layers=" << stats.totalLayers
+            << " measured=" << stats.counts.size()
+            << " materializationFailures=" << stats.failures.size()
+            << " columns=" << stats.columns
+            << " maxLayersPerColumn=" << stats.maxLayersPerColumn
+            << " zero=" << stats.zeroPolygons
+            << " p50=" << stats.p50 << " p95=" << stats.p95
+            << " p99=" << stats.p99 << " max=" << stats.maximum
+            << " limit=" << limit
+            << " overLimit=" << stats.offenders.size()
+            << " over32=" << stats.over32 << " over64=" << stats.over64
+            << " over128=" << stats.over128 << " elapsed=" << std::fixed
+            << std::setprecision(3) << stats.elapsedSeconds << "s\n";
+  std::cout << "Polycount histogram:";
+  for (const auto &[polygons, count] : stats.histogram)
+    std::cout << ' ' << polygons << ':' << count;
+  std::cout << '\n';
+  for (std::size_t i = 0; i < std::min<std::size_t>(20, stats.offenders.size());
+       ++i) {
+    const PolycountOffender &offender = stats.offenders[i];
+    std::cerr << "[ERROR] polycount exceeds limit (tx=" << offender.key.tx
+              << " ty=" << offender.key.ty
+              << " layer=" << offender.key.layer
+              << " world=" << offender.worldX << ',' << offender.worldZ
+              << " polygons=" << offender.polygonCount
+              << " limit=" << limit << ")\n";
+  }
+  if (stats.offenders.size() > 20)
+    std::cerr << "[ERROR] " << stats.offenders.size() - 20
+              << " additional offender(s) recorded in the report.\n";
+  for (std::size_t i = 0;
+       i < std::min<std::size_t>(20, stats.failures.size()); ++i) {
+    const MaterializationFailure &failure = stats.failures[i];
+    std::cerr << "[ERROR] materialization failed (tx=" << failure.key.tx
+              << " ty=" << failure.key.ty
+              << " layer=" << failure.key.layer
+              << " world=" << failure.worldX << ',' << failure.worldZ
+              << " stage=" << failure.stage
+              << " status=" << statusText(failure.status) << ")\n";
+  }
+  if (stats.failures.size() > 20)
+    std::cerr << "[ERROR] " << stats.failures.size() - 20
+              << " additional materialization failure(s) recorded in the "
+                 "report.\n";
+  writePolycountReport(reportPath, set, stats, limit, transitions.size());
+  if (!stats.offenders.empty() || !stats.failures.empty()) {
+    std::cerr << "Polycount histogram FAIL: " << stats.offenders.size()
+              << " layer(s) exceed " << limit << " polygons and "
+              << stats.failures.size() << " layer(s) do not materialize.\n";
+    return false;
+  }
+  std::cout << "Polycount histogram PASS: all " << stats.totalLayers
+            << " layer(s) fit <= " << limit << " polygons.\n";
+  return true;
+}
+
 template <typename T>
 void compareValue(const T &base, const T &overlay, const char *name) {
   if (base != overlay)
@@ -673,8 +1090,13 @@ void writeReport(const fs::path &path, const LoadedSet &base,
 
 struct CliOptions {
   fs::path baseDir, overlayDir, outputDir, reportPath;
+  fs::path transitionsPath;
   Rect replaceCoverage, overlayCoverage;
   bool haveReplace = false, haveOverlayCoverage = false;
+  bool polycountHistogram = false;
+  int maxPolys = 32;
+  int progressEvery = 250;
+  std::optional<std::pair<int, int>> histogramColumn;
   std::uint64_t maxPartBytes = DEFAULT_PART_BYTES;
 };
 
@@ -697,12 +1119,25 @@ CliOptions parseCli(int argc, char **argv) {
     };
     if (arg == "--base-dir")
       options.baseDir = value();
+    else if (arg == "--polycount-histogram")
+      options.polycountHistogram = true;
     else if (arg == "--overlay-dir")
       options.overlayDir = value();
     else if (arg == "--output-dir")
       options.outputDir = value();
     else if (arg == "--report")
       options.reportPath = value();
+    else if (arg == "--transitions")
+      options.transitionsPath = value();
+    else if (arg == "--max-polys")
+      options.maxPolys = parseInt(value());
+    else if (arg == "--progress-every")
+      options.progressEvery = parseInt(value());
+    else if (arg == "--column") {
+      const int tx = parseInt(value());
+      const int ty = parseInt(value());
+      options.histogramColumn = std::pair<int, int>{tx, ty};
+    }
     else if (arg == "--max-part-bytes") {
       const std::string text = value();
       std::size_t used = 0;
@@ -726,6 +1161,18 @@ CliOptions parseCli(int argc, char **argv) {
     } else {
       throw std::runtime_error("unknown option: " + arg);
     }
+  }
+  if (options.polycountHistogram) {
+    if (options.baseDir.empty() || options.maxPolys < 0 ||
+        options.progressEvery <= 0)
+      throw std::runtime_error(
+          "required: --polycount-histogram --base-dir <cache> "
+          "[--transitions <json>] [--max-polys <count>] [--report <json>]");
+    if (!options.overlayDir.empty() || !options.outputDir.empty() ||
+        options.haveReplace || options.haveOverlayCoverage)
+      throw std::runtime_error(
+          "polycount mode cannot be combined with overlay output options");
+    return options;
   }
   if (options.baseDir.empty() || options.overlayDir.empty() ||
       options.outputDir.empty() || !options.haveReplace ||
@@ -915,6 +1362,19 @@ int main(int argc, char **argv) {
     if (argc == 2 && std::string(argv[1]) == "--self-test")
       return selfTest();
     const CliOptions options = parseCli(argc, argv);
+    if (options.polycountHistogram) {
+      const LoadedSet set = loadSet(options.baseDir, "polycount input");
+      std::vector<h1emu::nav::NavigationTransition> transitions;
+      if (!options.transitionsPath.empty())
+        transitions = h1emu::nav::loadNavigationTransitions(
+            options.transitionsPath.string());
+      return runPolycountHistogram(set, transitions, options.maxPolys,
+                                   options.reportPath,
+                                   options.progressEvery,
+                                   options.histogramColumn)
+                 ? 0
+                 : 1;
+    }
     const LoadedSet base = loadSet(options.baseDir, "base");
     const LoadedSet overlay = loadSet(options.overlayDir, "overlay");
     OverlayStats stats;
