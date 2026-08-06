@@ -3,6 +3,9 @@ project(navmesh-builder C CXX)
 
 include(CTest)
 
+option(RECASTNAVIGATION_DT_POLYREF64
+    "Build Detour tools with 64-bit polygon references" OFF)
+
 set(CMAKE_CXX_STANDARD 17)
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
@@ -77,6 +80,11 @@ target_compile_definitions(navmesh-builder PRIVATE
     RC_MAX_LAYERS_DEF=255
 )
 
+if(RECASTNAVIGATION_DT_POLYREF64)
+    target_compile_definitions(navmesh-builder PRIVATE DT_POLYREF64)
+    target_compile_definitions(tilecache-overlay PRIVATE DT_POLYREF64)
+endif()
+
 if(MSVC)
     target_compile_options(forgelight-nav-source PRIVATE /W4 /O2)
     target_compile_definitions(forgelight-nav-source PRIVATE _CRT_SECURE_NO_WARNINGS)
@@ -105,6 +113,11 @@ else()
 endif()
 
 if(BUILD_TESTING)
+    if(RECASTNAVIGATION_DT_POLYREF64)
+        set(EXPECTED_MSET_VERSION_HEX 02000000)
+    else()
+        set(EXPECTED_MSET_VERSION_HEX 01000000)
+    endif()
     add_executable(compact-component-filter-test
         tests/compact_component_filter_test.cpp
         compact_component_filter.cpp
@@ -364,6 +377,7 @@ if(BUILD_TESTING)
             -DBUILDER=$<TARGET_FILE:navmesh-builder>
             -DSOURCE_DIR=${CMAKE_SOURCE_DIR}
             -DOUTPUT_DIR=${CMAKE_BINARY_DIR}/direct-nav-completeness
+            -DEXPECTED_MSET_VERSION_HEX=${EXPECTED_MSET_VERSION_HEX}
             -P ${CMAKE_SOURCE_DIR}/tests/verify_direct_nav_completeness.cmake
     )
 

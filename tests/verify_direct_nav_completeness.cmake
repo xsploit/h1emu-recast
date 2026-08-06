@@ -1,5 +1,7 @@
-if(NOT DEFINED BUILDER OR NOT DEFINED SOURCE_DIR OR NOT DEFINED OUTPUT_DIR)
-  message(FATAL_ERROR "BUILDER, SOURCE_DIR, and OUTPUT_DIR are required")
+if(NOT DEFINED BUILDER OR NOT DEFINED SOURCE_DIR OR NOT DEFINED OUTPUT_DIR OR
+   NOT DEFINED EXPECTED_MSET_VERSION_HEX)
+  message(FATAL_ERROR
+    "BUILDER, SOURCE_DIR, OUTPUT_DIR, and EXPECTED_MSET_VERSION_HEX are required")
 endif()
 
 file(REMOVE_RECURSE "${OUTPUT_DIR}")
@@ -68,4 +70,11 @@ endif()
 if(NOT EXISTS "${OUTPUT_DIR}/diagnostic/z1_0.bin" OR
    NOT EXISTS "${OUTPUT_DIR}/diagnostic/z1_cache_0.bin")
   message(FATAL_ERROR "Diagnostic override did not write both artifacts")
+endif()
+file(READ "${OUTPUT_DIR}/diagnostic/z1_0.bin" mset_version
+  OFFSET 4 LIMIT 4 HEX)
+string(TOLOWER "${mset_version}" mset_version)
+if(NOT mset_version STREQUAL EXPECTED_MSET_VERSION_HEX)
+  message(FATAL_ERROR
+    "MSET version ${mset_version} did not match ${EXPECTED_MSET_VERSION_HEX}")
 endif()

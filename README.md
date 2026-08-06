@@ -18,6 +18,25 @@ cmake -S . -B build-msvc -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build-msvc --parallel
 ```
 
+For a complete fine-resolution world artifact consumed by a matching
+`DT_POLYREF64` server runtime, build the native tools with 64-bit Detour
+polygon references as well:
+
+```bat
+cmake -S . -B build-polyref64 -DRECASTNAVIGATION_DT_POLYREF64=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build-polyref64 --config Release --parallel
+ctest --test-dir build-polyref64 -C Release --output-on-failure
+```
+
+This changes the direct MSET (`z1_*.bin`) tile-reference layout and stamps it
+as format version 2. A 64-bit direct artifact must only be loaded by a
+`DT_POLYREF64` runtime; the 32-bit version-1 and 64-bit version-2 direct
+formats are deliberately incompatible. TileCache TSET files retain format
+version 1, but a 64-bit build records the full Detour tile/polygon capacity in
+their mesh parameters. The builder prints `Detour refs: 64-bit` and the
+selected `maxTiles`/`maxPolys` values so full-map bake logs can prove which
+contract produced an artifact.
+
 ## Run
 
 ```sh

@@ -150,7 +150,13 @@ struct BuildOptions {
 };
 
 static const int NAVMESHSET_MAGIC = 'M' << 24 | 'S' << 16 | 'E' << 8 | 'T';
+#ifdef DT_POLYREF64
+// MSET embeds dtTileRef in each tile header. Version the 64-bit layout
+// separately so a 32-bit importer cannot silently misread it (and vice versa).
+static const int NAVMESHSET_VERSION = 2;
+#else
 static const int NAVMESHSET_VERSION = 1;
+#endif
 
 struct NavMeshSetHeader {
   int magic;
@@ -2158,9 +2164,16 @@ static bool parseOptions(int argc, char *argv[], int start,
       continue;
     }
     if (strcmp(arg, "--direct-nav-tile-bits") == 0) {
+#ifdef DT_POLYREF64
+      const int directTileBitLimit = (int)DT_TILE_BITS;
+#else
+      const int directTileBitLimit = 21;
+#endif
       if (++i >= argc || !parseInteger(argv[i], options.directNavTileBits) ||
-          options.directNavTileBits < 0 || options.directNavTileBits > 21) {
-        fprintf(stderr, "Invalid value for --direct-nav-tile-bits (0..21)\n");
+          options.directNavTileBits < 0 ||
+          options.directNavTileBits > directTileBitLimit) {
+        fprintf(stderr, "Invalid value for --direct-nav-tile-bits (0..%d)\n",
+                directTileBitLimit);
         return false;
       }
       continue;
@@ -2495,13 +2508,23 @@ int main(int argc, char *argv[]) {
   // for compatibility with a larger full-world cache.
   const long long capacityTileCount =
       options.globalBounds.enabled ? fullTileCount : totalTiles;
+#ifdef DT_POLYREF64
+  const int automaticTileBits = rcMin(
+      (int)ilog2(nextPow2((unsigned int)capacityTileCount)),
+      (int)DT_TILE_BITS);
+#else
   const int automaticTileBits = rcMin(
       (int)ilog2(nextPow2((unsigned int)capacityTileCount)), 14);
+#endif
   const int tileBits = options.directNavTileBits >= 0
                            ? options.directNavTileBits
                            : automaticTileBits;
   const int maxTiles = 1 << tileBits;
+#ifdef DT_POLYREF64
+  const int maxPolysPerTile = 1 << DT_POLY_BITS;
+#else
   const int maxPolysPerTile = 1 << (22 - tileBits);
+#endif
 
   printf("Tile grid : %d x %d full; building [%d..%d) x [%d..%d) = %d tiles"
          "  (%.2f wu/tile)\n",
@@ -2510,6 +2533,7 @@ int main(int argc, char *argv[]) {
   printf("Tile bits : %d%s  →  maxTiles=%d  maxPolys/tile=%d\n", tileBits,
          options.directNavTileBits >= 0 ? " (explicit)" : "", maxTiles,
          maxPolysPerTile);
+  printf("Detour refs: %zu-bit\n", sizeof(dtPolyRef) * 8);
   printf("Voxel     : cs=%.3f  ch=%.3f\n", CELL_SIZE, CELL_HEIGHT);
   printf("Agent     : height=%.2f  radius=%.2f  climb=%.2f  slope=%.1f°\n",
          AGENT_HEIGHT, AGENT_RADIUS, AGENT_MAX_CLIMB, AGENT_MAX_SLOPE);
@@ -3155,10 +3179,15 @@ int main(int argc, char *argv[]) {
       rcVcopy(tcMeshParams.orig, worldBmin);
       tcMeshParams.tileWidth = (float)TILE_SIZE * CELL_SIZE;
       tcMeshParams.tileHeight = (float)TILE_SIZE * CELL_SIZE;
+#ifdef DT_POLYREF64
+      tcMeshParams.maxTiles = nmParams.maxTiles;
+      tcMeshParams.maxPolys = nmParams.maxPolys;
+#else
       const int tcNavTileBits = std::min(
           (int)ilog2(nextPow2((unsigned int)rawMaxTiles)), 22 - 7);
       tcMeshParams.maxTiles = 1 << tcNavTileBits;
       tcMeshParams.maxPolys = 1 << (22 - tcNavTileBits);
+#endif
 
       memcpy(&header.meshParams, &tcMeshParams, sizeof(dtNavMeshParams));
       memcpy(&header.cacheParams, tileCache->getParams(),
