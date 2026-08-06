@@ -35,6 +35,7 @@
 #include "DetourTileCache.h"
 #include "DetourTileCacheBuilder.h"
 #include "Recast.h"
+#include "compact_component_filter.h"
 #include "fastlz.h"
 #include "forgelight_geometry_source.h"
 #include "forgelight_heightmap_loader.h"
@@ -1284,6 +1285,27 @@ static void debugCompactAreas(const char *stage,
   printf("\n");
 }
 
+static void pruneSemanticNoiseComponents(const char *stage,
+                                         rcCompactHeightfield &chf,
+                                         int borderSize, int tileX,
+                                         int tileY) {
+  constexpr int maxNoiseComponentCells = 4;
+  const unsigned char protectedAreas[] = {
+      NAV_AREA_STAIR, NAV_AREA_RAMP, NAV_AREA_THRESHOLD};
+  const CompactComponentFilterResult result =
+      pruneTinyInteriorCompactComponents(chf, borderSize,
+                                         maxNoiseComponentCells,
+                                         protectedAreas, 3);
+  if (getenv("H1EMU_NAV_DEBUG_COMPONENTS")) {
+    fprintf(stderr,
+            "[COMPONENT-FILTER] stage=%s tile=(%d,%d) components=%d "
+            "pruned=%d spans=%d maxCells=%d\n",
+            stage, tileX, tileY, result.componentsVisited,
+            result.componentsPruned, result.spansPruned,
+            maxNoiseComponentCells);
+  }
+}
+
 static bool validateSemanticRasterMapping(const TileRasterInput &mesh) {
   std::vector<int> triIds(mesh.triangleSemantics.size());
   for (size_t i = 0; i < triIds.size(); ++i)
@@ -1429,6 +1451,9 @@ static unsigned char *buildTile(rcContext *ctx, const GeometrySource &source,
     return nullptr;
   }
   debugCompactAreas("direct-after-erosion", *chf);
+  if (tileInput.semanticInput)
+    pruneSemanticNoiseComponents("direct-after-erosion", *chf,
+                                 cfg.borderSize, tileX, tileY);
 
   // Layer partitioning is designed for tiled, multi-storey worlds and cannot
   // produce the overlapping regions that make watershed fail in dense POIs.
@@ -1621,6 +1646,9 @@ buildTileCacheLayers(rcContext *ctx, const GeometrySource &source,
     return result;
   }
   debugCompactAreas("tilecache-after-erosion", *chf);
+  if (tileInput.semanticInput)
+    pruneSemanticNoiseComponents("tilecache-after-erosion", *chf,
+                                 cfg.borderSize, tileX, tileY);
 
   rcHeightfieldLayerSet *lset = rcAllocHeightfieldLayerSet();
   if (!lset || !rcBuildHeightfieldLayers(ctx, *chf, cfg.borderSize,

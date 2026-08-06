@@ -36,6 +36,7 @@ target_link_libraries(forgelight-nav-source-inspect PRIVATE
 
 add_executable(navmesh-builder
     main.cpp
+    compact_component_filter.cpp
     threshold_portal_geometry.cpp
     triangle_geometry.cpp
     ${RECAST_SOURCES}
@@ -104,6 +105,22 @@ else()
 endif()
 
 if(BUILD_TESTING)
+    add_executable(compact-component-filter-test
+        tests/compact_component_filter_test.cpp
+        compact_component_filter.cpp
+        ${RECAST_SOURCES})
+    target_include_directories(compact-component-filter-test PRIVATE
+        ${CMAKE_SOURCE_DIR}
+        ${RECAST_DIR}/Recast/Include)
+    if(MSVC)
+        target_compile_options(compact-component-filter-test PRIVATE /W4 /O2)
+    else()
+        target_compile_options(compact-component-filter-test PRIVATE
+            -Wall -Wextra -Wpedantic)
+    endif()
+    add_test(NAME compact-component-filter-contract
+        COMMAND compact-component-filter-test)
+
     add_executable(threshold-portal-geometry-test
         tests/threshold_portal_geometry_test.cpp
         threshold_portal_geometry.cpp)
